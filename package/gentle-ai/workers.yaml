@@ -1,0 +1,100 @@
+# Gentle AI — SDD Worker Bridge
+# Portable across Windows/Linux. No machine-absolute skill paths.
+# Location: ~/.config/gentle-ai/workers.yaml
+# Optional project override: <repo>/.atl/sdd-workers.yaml (deep-merge over this file)
+
+version: 1
+
+workers:
+  agy:
+    enabled: true
+    # Must be on PATH on every workstation
+    command: agy
+    extra_args:
+      - "--output-format"
+      - "json"
+      - "--dangerously-skip-permissions"
+    default_timeout: 10m
+    # explore can stay non-mutating at the FS layer; Engram writes still allowed by agent tools
+    plan_mode_explore: false
+    default_model: null
+    default_effort: medium
+    model_by_phase:
+      explore: gemini-3.6-flash-medium
+      propose: gemini-3.1-pro-high
+      spec: gemini-3.1-pro-high
+      design: claude-sonnet-4-6
+      tasks: gemini-3.6-flash-high
+      verify: claude-sonnet-4-6
+    # Tried once on quota/unavailable before switching worker
+    model_fallback:
+      - gemini-3.6-flash-high
+      - gemini-3.6-flash-medium
+    # Human profiles for ask UX (not raw model catalogs)
+    profiles:
+      fast:
+        label: Fast
+        model: gemini-3.6-flash-medium
+        effort: low
+      balanced:
+        label: Balanced
+        model: gemini-3.6-flash-high
+        effort: medium
+      strong:
+        label: Strong
+        model: gemini-3.1-pro-high
+        effort: high
+
+  opencode:
+    enabled: true
+    # Native task subagents: sdd-<phase>
+    # Model comes from opencode.json agent.sdd-<phase>.model when set
+
+policy:
+  # ask-each-phase | prefer-agy | prefer-opencode | opencode-only | agy-only
+  default: ask-each-phase
+  eligible:
+    - explore
+    - propose
+    - spec
+    - design
+    - tasks
+    - verify
+  ineligible:
+    - apply
+    - archive
+    - init
+    - onboard
+  # never | on-agy-ask | always-profiles
+  model_picker: on-agy-ask
+  phase_overrides: {}
+  # phase_overrides:
+  #   explore: { worker: agy, profile: fast }
+  #   verify: { worker: opencode }
+
+failover:
+  on:
+    - quota_exceeded
+    - timeout
+    - unavailable
+    - invalid_result_contract
+  try_model_fallback_once: true
+  to_other_worker: true
+  max_attempts_per_phase: 2
+
+timeouts:
+  explore: 10m
+  propose: 12m
+  spec: 12m
+  design: 15m
+  tasks: 10m
+  verify: 15m
+
+# Skill discovery roots (expanded at runtime; first hit wins per skill name)
+# {home} and {config} are portable tokens
+skill_discovery:
+  - "{config}/opencode/skills"
+  - "{home}/.gemini/antigravity-cli/skills"
+  - "{home}/.config/opencode/skills"
+  - "{repo}/.agents/skills"
+  - "{repo}/.agent/skills"
