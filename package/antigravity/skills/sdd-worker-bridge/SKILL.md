@@ -4,7 +4,7 @@ description: "SDD worker bridge for agy vs OpenCode phase runners. Trigger: SDD 
 license: MIT
 metadata:
   author: gentle-ai-local
-  version: "1.0"
+  version: "1.1"
 ---
 
 # SDD Worker Bridge (Orchestrator only)
@@ -170,6 +170,22 @@ Always include:
 ```text
 phase · worker · model · effort · duration · status · failover?
 ```
+
+## agy model / effort (v1.1)
+
+The runner (`run-agy-phase.mjs`) normalizes flags before spawn:
+
+| Model kind | `--effort` behavior |
+|------------|---------------------|
+| id ends with `-low\|-medium\|-high` (Gemini) | Force matching effort; never pass medium with `*-high` |
+| `claude-*`, some `gpt-oss*` | **Omit** `--effort` entirely |
+| other | Use configured effort if set |
+
+On `invalid model selection` / `conflicts with --effort` / `effort is not supported`, the runner **auto-retries once** with a corrected pair and sets `error_class: invalid_model_selection` only if still failing.
+
+Orchestrator should **not** manually debug agy flags for this class — trust the runner, then apply worker failover if needed.
+
+Prefer not passing mismatched `--effort` from the orchestrator; let config + runner normalize. If you pass both, runner still fixes them.
 
 ## Invariants
 

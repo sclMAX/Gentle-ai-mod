@@ -127,6 +127,22 @@ cd Gentle-ai-mod && git pull && node install.mjs
 
 ---
 
+## Changelog
+
+### v1.1
+
+- **Runner:** normalize Gemini model-suffix ↔ `--effort`; omit `--effort` for Claude
+- **Runner:** one automatic retry on `invalid model selection` / effort conflicts
+- **Runner:** `error_class: invalid_model_selection` for orchestrator failover
+- **Config:** `default_effort: null` (avoid forcing medium onto `*-high` models)
+- **Config:** design/verify may use Claude safely (effort stripped)
+
+### v1.0
+
+- Initial worker bridge package + cross-platform installer
+
+---
+
 ## License
 
 MIT — see [LICENSE](./LICENSE)
