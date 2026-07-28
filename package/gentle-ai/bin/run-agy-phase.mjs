@@ -679,35 +679,43 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
 
     let stdout = "";
     let stderr = "";
+    let progressLineBuf = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => {
       const chunk = String(d);
       stdout += chunk;
       if (streamProgress) {
-        // NDJSON may arrive partial; scan complete lines ending in DONE step_update
-        const lines = chunk.split(/\r?\n/);
-        for (const line of lines) {
+        // agy 1.1.8 NDJSON: {"event":"step_update","step_update":{"state":"DONE","step_type":"..."}}
+        // Buffer across chunks so partial lines are not dropped.
+        progressLineBuf += chunk;
+        const parts = progressLineBuf.split(/\r?\n/);
+        progressLineBuf = parts.pop() || "";
+        for (const line of parts) {
           const t = line.trim();
           if (!t.startsWith("{")) continue;
           try {
             const ev = JSON.parse(t);
-            if (
-              ev &&
-              ev.event === "step_update" &&
-              String(ev.status || ev.state || "").toUpperCase() === "DONE"
-            ) {
-              const label =
-                ev.step ||
-                ev.name ||
-                ev.title ||
-                ev.message ||
-                ev.id ||
-                "step";
-              process.stderr.write(`[agy] step done: ${label}\n`);
-            }
+            if (!ev || ev.event !== "step_update") continue;
+            const su =
+              ev.step_update && typeof ev.step_update === "object"
+                ? ev.step_update
+                : ev;
+            const state = String(su.state || su.status || ev.state || "").toUpperCase();
+            if (state !== "DONE") continue;
+            const label =
+              su.step_type ||
+              su.step ||
+              su.name ||
+              su.title ||
+              su.message ||
+              ev.step_type ||
+              ev.step ||
+              (su.step_index != null ? `step_${su.step_index}` : null) ||
+              "step";
+            process.stderr.write(`[agy] step done: ${label}\n`);
           } catch {
-            /* ignore partial */
+            /* ignore partial / non-json */
           }
         }
       }
