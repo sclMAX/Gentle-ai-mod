@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gentle-ai.local/schemas/sdd-phase-result.schema.json",
+  "title": "SDD phase result contract",
+  "description": "Default structured output for run-agy-phase (Gentle-ai-mod v1.2). Prefer simple types; status is a free string for reliability.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "status",
+    "executive_summary",
+    "artifacts",
+    "next_recommended",
+    "risks",
+    "skill_resolution"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "description": "Phase outcome, e.g. success | failed | partial"
+    },
+    "executive_summary": {
+      "type": "string",
+      "description": "Short human-readable summary of what was done"
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "Artifact references (topic keys, paths, or observation ids as strings)",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_recommended": {
+      "type": "string",
+      "description": "Next recommended SDD step or action"
+    },
+    "risks": {
+      "type": "array",
+      "description": "Risks as strings or small objects",
+      "items": {
+        "anyOf": [
+          { "type": "string" },
+          { "type": "object", "additionalProperties": true }
+        ]
+      }
+    },
+    "skill_resolution": {
+      "type": "string",
+      "description": "How skills were resolved, e.g. paths-injected | fallback-path | none"
+    }
+  }
+}

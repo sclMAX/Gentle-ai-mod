@@ -14,7 +14,7 @@ Repo: https://github.com/sclMAX/Gentle-ai-mod
 
 | Target | Contents |
 |--------|----------|
-| `~/.config/gentle-ai/` | `workers.yaml`, `bin/run-agy-phase.mjs`, `bin/patch-orchestrator-worker-bridge.mjs` |
+| `~/.config/gentle-ai/` | `workers.yaml`, `bin/run-agy-phase.mjs`, `bin/patch-orchestrator-worker-bridge.mjs`, `schemas/sdd-phase-result.schema.json` |
 | `~/.config/opencode/skills/sdd-worker-bridge/` | Orchestrator skill + phase-launch checklist |
 | `~/.gemini/antigravity-cli/skills/sdd-worker-bridge/` | Same skill mirrored for agy (if Antigravity present) |
 | `~/.config/opencode/opencode.json` | Patches `gentle-orchestrator` prompt (Workers preflight + HARD GATE). **Backup created first.** |
@@ -57,6 +57,7 @@ node install.mjs
 ### Options
 
 ```text
+node install.mjs --check           # health check only (exit 0/1, no writes)
 node install.mjs --dry-run         # show actions only
 node install.mjs --no-patch        # skip opencode.json prompt patch
 node install.mjs --no-antigravity  # skip agy skills mirror
@@ -108,6 +109,16 @@ node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
   --effort medium
 ```
 
+Runner v1.2 flags (defaults from `workers.yaml` when omitted):
+
+```text
+--output-format json|stream-json   # default json
+--json-schema default|none|<path>  # default: shipped sdd-phase-result schema
+--no-json-schema                   # alias for --json-schema none
+--stream-progress                  # stderr step DONE lines (stream-json only)
+--dry-run                          # print final CLI args (includes format + schema path)
+```
+
 Re-apply orchestrator patch after a Gentle/OpenCode upgrade overwrites prompts:
 
 ```bash
@@ -128,6 +139,15 @@ cd Gentle-ai-mod && git pull && node install.mjs
 ---
 
 ## Changelog
+
+### v1.2
+
+- **Runner:** default `--json-schema` (`schemas/sdd-phase-result.schema.json`) + `--output-format json`
+- **Runner:** prefer `structured_output`; strip markdown fences; parse `stream-json` NDJSON `result` event
+- **Runner:** `--stream-progress` (stderr), envelope fields `output_format`, `json_schema_path`, `structured_output_used`
+- **Installer:** copies `schemas/`; `node install.mjs --check` health mode
+- **Installer:** patches honest Review Workload Forecast rules into installed `sdd-tasks` (range + confidence)
+- **Config:** `workers.agy.output_format` / `json_schema` scalar defaults
 
 ### v1.1
 

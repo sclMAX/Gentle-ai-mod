@@ -3,10 +3,11 @@
  * Gentle-ai-mod installer — Windows + Linux
  *
  * Installs:
- *   ~/.config/gentle-ai/                 (workers.yaml + bin runners)
+ *   ~/.config/gentle-ai/                 (workers.yaml + bin runners + schemas)
  *   ~/.config/opencode/skills/sdd-worker-bridge/
  *   optional: Antigravity skills mirror
  *   patches gentle-orchestrator prompt in opencode.json (backup first)
+ *   optional: honest forecast rules into sdd-tasks SKILL.md
  *
  * Usage:
  *   node install.mjs
@@ -14,6 +15,7 @@
  *   node install.mjs --no-patch
  *   node install.mjs --no-antigravity
  *   node install.mjs --force
+ *   node install.mjs --check
  */
 
 import {
@@ -23,11 +25,12 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
-  statSync,
   writeFileSync,
   chmodSync,
+  accessSync,
+  constants,
 } from "node:fs";
-import { homedir, platform } from "node:os";
+import { homedir, platform, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -41,6 +44,7 @@ const DRY = args.has("--dry-run");
 const NO_PATCH = args.has("--no-patch");
 const NO_AGY_SKILL = args.has("--no-antigravity");
 const FORCE = args.has("--force");
+const CHECK = args.has("--check");
 const HELP = args.has("--help") || args.has("-h");
 
 if (HELP) {
@@ -49,6 +53,7 @@ if (HELP) {
 Usage: node install.mjs [options]
 
 Options:
+  --check           Health check only (no writes); exit 0 if healthy enough
   --dry-run         Show actions without writing
   --no-patch        Do not patch opencode.json orchestrator prompt
   --no-antigravity  Skip Antigravity skills mirror
@@ -157,16 +162,31 @@ function installGentleAi() {
     join(destRoot, "bin", "patch-orchestrator-worker-bridge.mjs")
   );
 
+  const schemasSrc = join(PKG, "gentle-ai", "schemas");
+  if (existsSync(schemasSrc)) {
+    copyTree(schemasSrc, join(destRoot, "schemas"));
+  } else {
+    log("WARN: package/gentle-ai/schemas missing — skip schema install");
+  }
+
   // small local readme
   const readme = join(destRoot, "README.md");
   const body = `# gentle-ai (installed by Gentle-ai-mod)
 
 - workers.yaml — SDD worker bridge policy
-- bin/run-agy-phase.mjs — launch one SDD phase via agy
+- bin/run-agy-phase.mjs — launch one SDD phase via agy (v1.2: json-schema default)
 - bin/patch-orchestrator-worker-bridge.mjs — re-apply orchestrator prompt patch
+- schemas/sdd-phase-result.schema.json — default phase result contract for --json-schema
 
 Re-run installer from the repo after upgrades:
   node install.mjs
+  node install.mjs --check
+
+Runner flags (v1.2):
+  --output-format json|stream-json
+  --json-schema default|none|<path>
+  --no-json-schema
+  --stream-progress
 
 Restart OpenCode after install/patch.
 `;
@@ -229,6 +249,101 @@ function installAntigravitySkill() {
   }
 }
 
+/**
+ * Replace ### Review Workload Forecast Rules … next ### heading
+ * with improved content from package patch file.
+ */
+function patchSddTasksForecast() {
+  const skillPath = homeConfig("opencode", "skills", "sdd-tasks", "SKILL.md");
+  const patchPath = join(PKG, "opencode", "skills-patches", "sdd-tasks-forecast.md");
+
+  if (!existsSync(skillPath)) {
+    log("WARN: sdd-tasks SKILL.md not found — skip forecast patch");
+    return;
+  }
+  if (!existsSync(patchPath)) {
+    log("WARN: sdd-tasks-forecast.md patch missing — skip forecast patch");
+    return;
+  }
+
+  const original = readFileSync(skillPath, "utf8");
+  const startRe = /^### Review Workload Forecast Rules\s*$/m;
+  const startMatch = original.match(startRe);
+  if (!startMatch) {
+    log("WARN: Review Workload Forecast Rules section missing in sdd-tasks — skip");
+    return;
+  }
+
+  const startIdx = startMatch.index;
+  const afterStart = original.slice(startIdx + startMatch[0].length);
+  // next ### heading at same level (not ####)
+  const nextHeading = afterStart.match(/\n### [^\n#]/);
+  let endIdx;
+  if (nextHeading) {
+    endIdx = startIdx + startMatch[0].length + nextHeading.index + 1; // keep the \n before next ###
+  } else {
+    endIdx = original.length;
+  }
+
+  let patchBody = readFileSync(patchPath, "utf8").trimEnd() + "\n\n";
+  // Ensure patch starts with the heading
+  if (!patchBody.startsWith("### Review Workload Forecast Rules")) {
+    patchBody = "### Review Workload Forecast Rules\n\n" + patchBody;
+  }
+
+  // Also upgrade the template table at top of tasks artifact if present
+  let next = original.slice(0, startIdx) + patchBody + original.slice(endIdx);
+  next = upgradeTasksTemplateTable(next);
+
+  if (next === original) {
+    log("sdd-tasks forecast: already up to date");
+    return;
+  }
+
+  if (DRY) {
+    log(`[dry-run] patch forecast rules in ${skillPath}`);
+    return;
+  }
+
+  const bak = backupFile(skillPath);
+  writeFileSync(skillPath, next, "utf8");
+  log(`patched sdd-tasks forecast rules${bak ? ` (backup ${bak})` : ""}`);
+}
+
+function upgradeTasksTemplateTable(src) {
+  const oldTable = `| Field | Value |
+|-------|-------|
+| Estimated changed lines | <rough estimate or range> |
+| 400-line budget risk | Low / Medium / High |
+| Chained PRs recommended | Yes / No |
+| Suggested split | <single PR or PR 1 → PR 2 → PR 3> |
+| Delivery strategy | <ask-on-risk / auto-chain / single-pr / exception-ok> |
+| Chain strategy | <stacked-to-main / feature-branch-chain / size-exception / pending> |`;
+
+  const newTable = `| Field | Value |
+|-------|-------|
+| Estimated changed lines | <low-high range, e.g. 180-320> |
+| Estimate method | <signals used: file counts, new/edit, tests, wiring> |
+| Confidence | Low / Medium / High |
+| Files touched (approx) | <N prod + M test + K config/docs> |
+| Test lines share | <approx % or lines> |
+| Generated/vendor lines excluded from budget? | Yes/No + note |
+| 400-line budget risk | Low / Medium / High |
+| Chained PRs recommended | Yes / No |
+| Suggested split | <single PR or PR 1 → PR 2 → PR 3> |
+| Delivery strategy | <ask-on-risk / auto-chain / single-pr / exception-ok> |
+| Chain strategy | <stacked-to-main / feature-branch-chain / size-exception / pending> |`;
+
+  if (src.includes(oldTable)) {
+    return src.replace(oldTable, newTable);
+  }
+  // Already patched or custom — leave alone
+  if (src.includes("Estimate method") && src.includes("Generated/vendor lines excluded")) {
+    return src;
+  }
+  return src;
+}
+
 function runPatch() {
   if (NO_PATCH) {
     log("skip orchestrator patch (--no-patch)");
@@ -287,7 +402,231 @@ function smoke() {
   }
 }
 
+function pass(msg) {
+  log(`PASS  ${msg}`);
+}
+function fail(msg) {
+  log(`FAIL  ${msg}`);
+}
+function warn(msg) {
+  log(`WARN  ${msg}`);
+}
+
+function runCheck() {
+  log("=== Gentle-ai-mod --check ===");
+  let critical = 0;
+  let warnings = 0;
+
+  // node version
+  const major = Number(String(process.versions.node).split(".")[0]);
+  if (major >= 18) pass(`node v${process.versions.node} (>=18)`);
+  else {
+    fail(`node v${process.versions.node} (need >=18)`);
+    critical++;
+  }
+
+  // package/ when run from mod repo
+  const looksLikeRepo =
+    existsSync(join(ROOT, "package", "gentle-ai")) ||
+    existsSync(join(ROOT, "install.mjs"));
+  if (looksLikeRepo) {
+    if (existsSync(PKG) && existsSync(join(PKG, "gentle-ai"))) {
+      pass(`package/ present at ${PKG}`);
+    } else {
+      fail("package/ missing next to install.mjs");
+      critical++;
+    }
+  } else {
+    warn("not run from Gentle-ai-mod repo (package/ check skipped)");
+    warnings++;
+  }
+
+  // workers.yaml
+  const workers = homeConfig("gentle-ai", "workers.yaml");
+  if (existsSync(workers)) pass(`workers.yaml: ${workers}`);
+  else {
+    fail(`workers.yaml missing: ${workers}`);
+    critical++;
+  }
+
+  // runner
+  const runner = homeConfig("gentle-ai", "bin", "run-agy-phase.mjs");
+  if (existsSync(runner)) {
+    let execOk = false;
+    try {
+      accessSync(runner, constants.R_OK);
+      execOk = true;
+      if (platform() !== "win32") {
+        try {
+          accessSync(runner, constants.X_OK);
+        } catch {
+          warn("runner exists but not executable bit (node can still run it)");
+          warnings++;
+        }
+      }
+    } catch {
+      execOk = false;
+    }
+    if (execOk) {
+      const head = readFileSync(runner, "utf8").slice(0, 2500);
+      if (/v1\.2|json-schema/i.test(head)) {
+        pass(`runner v1.2 marker: ${runner}`);
+      } else {
+        fail(`runner present but missing v1.2/json-schema marker: ${runner}`);
+        critical++;
+      }
+    } else {
+      fail(`runner not readable: ${runner}`);
+      critical++;
+    }
+  } else {
+    fail(`runner missing: ${runner}`);
+    critical++;
+  }
+
+  // schema
+  const schema = homeConfig(
+    "gentle-ai",
+    "schemas",
+    "sdd-phase-result.schema.json"
+  );
+  if (existsSync(schema)) pass(`schema: ${schema}`);
+  else {
+    warn(`schema missing (pre-1.2 install?): ${schema}`);
+    warnings++;
+  }
+
+  // skill
+  const skill = homeConfig("opencode", "skills", "sdd-worker-bridge", "SKILL.md");
+  if (existsSync(skill)) pass(`sdd-worker-bridge: ${skill}`);
+  else {
+    fail(`sdd-worker-bridge missing: ${skill}`);
+    critical++;
+  }
+
+  // agy
+  const agy = which("agy");
+  if (agy) {
+    const ver = spawnSync("agy", ["--version"], { encoding: "utf8" });
+    const v = ((ver.stdout || ver.stderr || "").trim().split(/\r?\n/)[0] || "").trim();
+    pass(`agy on PATH: ${agy}${v ? ` (${v})` : ""}`);
+  } else {
+    warn("agy not on PATH");
+    warnings++;
+  }
+
+  // gentle-ai CLI optional
+  const gentle = which("gentle-ai");
+  if (gentle) pass(`gentle-ai on PATH: ${gentle}`);
+  else {
+    warn("gentle-ai not on PATH");
+    warnings++;
+  }
+
+  // engram
+  const engram = which("engram");
+  if (engram) pass(`engram on PATH: ${engram}`);
+  else {
+    warn("engram not on PATH");
+    warnings++;
+  }
+
+  // opencode.json
+  const oc = homeConfig("opencode", "opencode.json");
+  if (existsSync(oc)) pass(`opencode.json: ${oc}`);
+  else {
+    fail(`opencode.json missing: ${oc}`);
+    critical++;
+  }
+
+  // orchestrator patch marker
+  let markerFound = false;
+  if (existsSync(oc)) {
+    try {
+      const raw = readFileSync(oc, "utf8");
+      if (
+        /sdd-worker-bridge|Worker Bridge|Workers:|worker_policy|run-agy-phase/i.test(
+          raw
+        )
+      ) {
+        markerFound = true;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  // also check agent prompt files if present
+  if (!markerFound) {
+    const agentCandidates = [
+      homeConfig("opencode", "agent", "gentle-orchestrator.md"),
+      homeConfig("opencode", "agents", "gentle-orchestrator.md"),
+    ];
+    for (const p of agentCandidates) {
+      if (!existsSync(p)) continue;
+      try {
+        const t = readFileSync(p, "utf8");
+        if (/sdd-worker-bridge|Worker Bridge|Workers:/i.test(t)) {
+          markerFound = true;
+          break;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  if (markerFound) pass("orchestrator worker-bridge marker found");
+  else {
+    warn("orchestrator patch marker not found (Workers / sdd-worker-bridge)");
+    warnings++;
+  }
+
+  // runner dry-run smoke
+  if (existsSync(runner)) {
+    const smokeCwd = existsSync(ROOT) ? ROOT : tmpdir();
+    const r = spawnSync(
+      process.execPath,
+      [
+        runner,
+        "--dry-run",
+        "--phase",
+        "explore",
+        "--change",
+        "install-check",
+        "--project",
+        "smoke",
+        "--cwd",
+        smokeCwd,
+      ],
+      { encoding: "utf8" }
+    );
+    if (r.status === 0 || r.status === 3) {
+      pass(`runner dry-run smoke exit ${r.status}`);
+    } else {
+      fail(`runner dry-run smoke exit ${r.status}`);
+      if (r.stderr) log((r.stderr || "").slice(0, 400));
+      if (r.stdout) log((r.stdout || "").slice(0, 400));
+      critical++;
+    }
+  } else {
+    warn("runner dry-run skipped (runner missing)");
+    warnings++;
+  }
+
+  log("");
+  log(
+    critical === 0
+      ? `=== check OK (${warnings} warning(s)) ===`
+      : `=== check FAILED (${critical} critical, ${warnings} warning(s)) ===`
+  );
+  process.exit(critical === 0 ? 0 : 1);
+}
+
 function main() {
+  if (CHECK) {
+    runCheck();
+    return;
+  }
+
   log("=== Gentle-ai-mod install ===");
   log(`source: ${ROOT}`);
   log(`home:   ${homedir()}`);
@@ -297,6 +636,7 @@ function main() {
   installGentleAi();
   installOpenCodeSkill();
   installAntigravitySkill();
+  patchSddTasksForecast();
   runPatch();
   smoke();
 
@@ -306,6 +646,7 @@ function main() {
   log("  1. Restart OpenCode (required to load orchestrator prompt + skill)");
   log("  2. Start an SDD session — preflight should show Workers tab");
   log("  3. Optional project override: <repo>/.atl/sdd-workers.yaml");
+  log("  4. Health: node install.mjs --check");
   if (DRY) log("(dry-run: no files were written)");
 }
 

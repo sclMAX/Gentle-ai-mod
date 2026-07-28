@@ -4,7 +4,7 @@ description: "SDD worker bridge for agy vs OpenCode phase runners. Trigger: SDD 
 license: MIT
 metadata:
   author: gentle-ai-local
-  version: "1.1"
+  version: "1.2"
 ---
 
 # SDD Worker Bridge (Orchestrator only)
@@ -186,6 +186,25 @@ On `invalid model selection` / `conflicts with --effort` / `effort is not suppor
 Orchestrator should **not** manually debug agy flags for this class — trust the runner, then apply worker failover if needed.
 
 Prefer not passing mismatched `--effort` from the orchestrator; let config + runner normalize. If you pass both, runner still fixes them.
+
+## Structured output (v1.2)
+
+Runner defaults (overridable via CLI or `workers.agy`):
+
+| Flag / key | Default | Notes |
+|------------|---------|--------|
+| `--output-format` / `output_format` | `json` | Also `stream-json` (NDJSON; last `event=result`) |
+| `--json-schema` / `json_schema` | `default` | Ships `schemas/sdd-phase-result.schema.json` |
+| `--no-json-schema` | — | Alias for `--json-schema none` |
+| `--stream-progress` | off | With stream-json: brief DONE lines on **stderr** |
+
+Parsing prefers `structured_output` object; else strips markdown fences from `response` and JSON-parses. Envelope includes `output_format`, `json_schema_path`, `structured_output_used`.
+
+Health after install:
+
+```bash
+node /path/to/Gentle-ai-mod/install.mjs --check
+```
 
 ## Invariants
 

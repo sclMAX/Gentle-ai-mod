@@ -2,6 +2,11 @@
 /**
  * run-agy-phase — cross-platform SDD phase launcher for Antigravity CLI (agy)
  *
+ * v1.2:
+ *   - Default --json-schema (sdd-phase-result.schema.json) + --output-format
+ *   - Prefer structured_output; strip fences; stream-json NDJSON result event
+ *   - Optional --stream-progress (stderr) for stream-json step_update DONE
+ *
  * v1.1:
  *   - Normalize model/effort pairing (Gemini suffix vs Claude no-effort)
  *   - Auto-retry once on invalid model/effort selection
@@ -26,7 +31,11 @@ import {
   readFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, delimiter } from "node:path";
+import { dirname, join, resolve, delimiter } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const ELIGIBLE = new Set([
   "explore",
@@ -38,6 +47,7 @@ const ELIGIBLE = new Set([
 ]);
 
 const EFFORT_LEVELS = new Set(["low", "medium", "high"]);
+const OUTPUT_FORMATS = new Set(["json", "stream-json"]);
 
 function die(code, msg, extra = {}) {
   const envelope = {
@@ -49,6 +59,38 @@ function die(code, msg, extra = {}) {
   process.stderr.write(String(msg).endsWith("\n") ? msg : msg + "\n");
   process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
   process.exit(code);
+}
+
+function printHelp() {
+  process.stdout.write(`run-agy-phase — launch one SDD phase via agy (portable)
+
+Usage:
+  node run-agy-phase.mjs --phase <phase> --change <name> --project <proj> --cwd <repo> [options]
+
+Required:
+  --phase <name>           explore|propose|spec|design|tasks|verify
+  --change <name>          SDD change name
+  --project <name>         Engram / project id
+  --cwd <path>             repo working directory
+
+Options:
+  --model <id>             agy model id
+  --effort <level>         low|medium|high (normalized; omitted for Claude)
+  --timeout <dur>          e.g. 10m
+  --artifact-store <mode>  engram|openspec|hybrid|none (default engram)
+  --prompt-file <path>     phase prompt file
+  --prompt <text>          inline prompt (prefer --prompt-file)
+  --config <path>          workers.yaml override
+  --output-format <fmt>    json|stream-json (default: json, or workers.yaml)
+  --json-schema <spec>     path|default|none (default: default)
+  --no-json-schema         alias for --json-schema none
+  --stream-progress        stderr progress for stream-json step_update DONE
+  --dry-run                print resolved CLI args and exit 0
+  --json                   kept for compatibility (always JSON envelope)
+  -h, --help               show help
+
+Exit codes: 0 ok | 2 usage | 3 agy missing | 4 agy fail | 5 contract
+`);
 }
 
 function parseArgs(argv) {
@@ -66,6 +108,11 @@ function parseArgs(argv) {
     config: null,
     dryRun: false,
     json: true,
+    outputFormat: null, // null = use config default then json
+    jsonSchema: null, // null = use config default then default
+    streamProgress: false,
+    outputFormatExplicit: false,
+    jsonSchemaExplicit: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -104,6 +151,25 @@ function parseArgs(argv) {
       case "--config":
         out.config = resolve(next());
         break;
+      case "--output-format": {
+        const v = next();
+        out.outputFormat = v;
+        out.outputFormatExplicit = true;
+        break;
+      }
+      case "--json-schema": {
+        const v = next();
+        out.jsonSchema = v;
+        out.jsonSchemaExplicit = true;
+        break;
+      }
+      case "--no-json-schema":
+        out.jsonSchema = "none";
+        out.jsonSchemaExplicit = true;
+        break;
+      case "--stream-progress":
+        out.streamProgress = true;
+        break;
       case "--dry-run":
         out.dryRun = true;
         break;
@@ -112,9 +178,7 @@ function parseArgs(argv) {
         break;
       case "--help":
       case "-h":
-        process.stdout.write(
-          "run-agy-phase — launch one SDD phase via agy (portable)\n"
-        );
+        printHelp();
         process.exit(0);
       default:
         if (a.startsWith("-"))
@@ -405,6 +469,93 @@ function resolveModelEffort(cfg, phase, model, effort) {
   return normalizeModelEffort(rawModel, rawEffort, { source: "config" });
 }
 
+function resolveOutputFormat(cfg, cliValue, explicit) {
+  if (explicit && cliValue) {
+    const v = String(cliValue).toLowerCase();
+    if (!OUTPUT_FORMATS.has(v)) {
+      die(2, `Invalid --output-format: ${cliValue} (use json|stream-json)`);
+    }
+    return v;
+  }
+  const fromCfg = cfg.workers?.agy?.output_format;
+  if (fromCfg != null && fromCfg !== "") {
+    const v = String(fromCfg).toLowerCase();
+    if (!OUTPUT_FORMATS.has(v)) {
+      die(2, `Invalid workers.agy.output_format: ${fromCfg}`);
+    }
+    return v;
+  }
+  return "json";
+}
+
+/**
+ * Resolve json-schema path or null (disabled).
+ * Spec: default | none | absolute/relative path
+ */
+function resolveJsonSchemaPath(cfg, cliValue, explicit) {
+  let spec = "default";
+  if (explicit) {
+    spec = cliValue == null || cliValue === "" ? "default" : String(cliValue);
+  } else if (cfg.workers?.agy?.json_schema != null) {
+    spec = String(cfg.workers.agy.json_schema);
+  }
+
+  if (spec === "none" || spec === "false" || spec === "off") return null;
+  if (spec === "default" || spec === "true" || spec === "on") {
+    return findDefaultSchemaPath();
+  }
+
+  const abs = resolve(spec);
+  if (!existsSync(abs)) {
+    die(2, `json-schema file not found: ${abs}`);
+  }
+  return abs;
+}
+
+function findDefaultSchemaPath() {
+  const candidates = [
+    // installed next to runner: ~/.config/gentle-ai/bin/../schemas/...
+    join(__dirname, "..", "schemas", "sdd-phase-result.schema.json"),
+    // package layout if runner invoked from repo package/
+    join(__dirname, "..", "..", "schemas", "sdd-phase-result.schema.json"),
+    join(homedir(), ".config", "gentle-ai", "schemas", "sdd-phase-result.schema.json"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return resolve(p);
+  }
+  die(2, "default json-schema not found (expected schemas/sdd-phase-result.schema.json)", {
+    error_class: "unavailable",
+    tried: candidates,
+  });
+}
+
+/**
+ * Strip conflicting --output-format / --json-schema from extra_args, then append ours.
+ */
+function mergeExtraArgs(extraArgs, outputFormat, jsonSchemaPath) {
+  const base = Array.isArray(extraArgs) ? [...extraArgs] : [];
+  const cleaned = [];
+  for (let i = 0; i < base.length; i++) {
+    const a = base[i];
+    if (a === "--output-format" || a === "--json-schema") {
+      i += 1; // skip value
+      continue;
+    }
+    if (
+      typeof a === "string" &&
+      (a.startsWith("--output-format=") || a.startsWith("--json-schema="))
+    ) {
+      continue;
+    }
+    cleaned.push(a);
+  }
+  cleaned.push("--output-format", outputFormat);
+  if (jsonSchemaPath) {
+    cleaned.push("--json-schema", jsonSchemaPath);
+  }
+  return cleaned;
+}
+
 function buildDefaultPrompt({
   phase,
   change,
@@ -445,14 +596,14 @@ ${skillBlock || "(none resolved — follow built-in Gentle SDD conventions)"}
 3. Persist this phase artifact with canonical topic_key sdd/${change}/${topic}
 
 # FINAL RESPONSE FORMAT
-Return ONLY valid JSON (no markdown fences) with this shape:
+Return structured output matching the json-schema when provided. Shape:
 {
-  "status": "success" | "failed" | "partial",
+  "status": "success",
   "executive_summary": "string",
-  "artifacts": { "topic_keys": [], "paths": [], "observation_ids": [] },
+  "artifacts": ["topic or path strings"],
   "next_recommended": "string",
   "risks": ["string"],
-  "skill_resolution": "paths-injected" | "fallback-path" | "none",
+  "skill_resolution": "paths-injected",
   "worker": "agy",
   "phase": "sdd-${phase}",
   "project": "${project}",
@@ -516,7 +667,7 @@ function buildCliArgs({
   return cliArgs;
 }
 
-function runAgyOnce({ agyPath, cliArgs, cwd, env }) {
+function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
   return new Promise((resolvePromise) => {
     const started = Date.now();
     const child = spawn(agyPath, cliArgs, {
@@ -531,7 +682,35 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env }) {
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => {
-      stdout += d;
+      const chunk = String(d);
+      stdout += chunk;
+      if (streamProgress) {
+        // NDJSON may arrive partial; scan complete lines ending in DONE step_update
+        const lines = chunk.split(/\r?\n/);
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("{")) continue;
+          try {
+            const ev = JSON.parse(t);
+            if (
+              ev &&
+              ev.event === "step_update" &&
+              String(ev.status || ev.state || "").toUpperCase() === "DONE"
+            ) {
+              const label =
+                ev.step ||
+                ev.name ||
+                ev.title ||
+                ev.message ||
+                ev.id ||
+                "step";
+              process.stderr.write(`[agy] step done: ${label}\n`);
+            }
+          } catch {
+            /* ignore partial */
+          }
+        }
+      }
     });
     child.stderr.on("data", (d) => {
       stderr += d;
@@ -559,41 +738,237 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env }) {
   });
 }
 
-function parseAgyResult({ code, stdout, stderr, duration_s, meta, timedOut }) {
-  let parsed = null;
+function stripMarkdownFences(text) {
+  let s = String(text || "").trim();
+  // ```json ... ``` or ``` ... ```
+  const fenced = s.match(/^```(?:json|JSON)?\s*\r?\n?([\s\S]*?)\r?\n?```\s*$/);
+  if (fenced) return fenced[1].trim();
+  // leading fence without clean end
+  if (s.startsWith("```")) {
+    s = s.replace(/^```(?:json|JSON)?\s*\r?\n?/, "");
+    s = s.replace(/\r?\n?```\s*$/, "");
+    return s.trim();
+  }
+  return s;
+}
+
+function tryParseJsonObject(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
   try {
-    parsed = JSON.parse((stdout || "").trim() || "null");
+    return JSON.parse(s);
   } catch {
-    const errClass =
-      classifyError(stderr + stdout, code, timedOut) || "contract";
-    return {
-      ok: false,
-      envelope: {
-        status: "failed",
-        error_class: errClass,
-        message: "agy stdout was not valid JSON",
-        exit_code: code,
-        duration_s,
-        stderr_tail: (stderr || "").slice(-2000),
-        stdout_tail: (stdout || "").slice(-2000),
-        ...meta,
-      },
-    };
+    /* fall through */
+  }
+  return null;
+}
+
+/**
+ * Parse first or last valid JSON object from concatenated JSON (stream quirk).
+ * Prefer object that has a `status` field; else last successful parse.
+ */
+function parseJsonLoose(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+  const direct = tryParseJsonObject(s);
+  if (direct && typeof direct === "object") return direct;
+
+  const stripped = stripMarkdownFences(s);
+  const afterFence = tryParseJsonObject(stripped);
+  if (afterFence && typeof afterFence === "object") return afterFence;
+
+  // Scan for balanced {...} objects
+  const objects = [];
+  for (let i = 0; i < stripped.length; i++) {
+    if (stripped[i] !== "{") continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < stripped.length; j++) {
+      const c = stripped[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') {
+        inStr = true;
+        continue;
+      }
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          const slice = stripped.slice(i, j + 1);
+          const obj = tryParseJsonObject(slice);
+          if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+            objects.push(obj);
+          }
+          i = j;
+          break;
+        }
+      }
+    }
   }
 
-  let inner = parsed;
-  if (parsed && typeof parsed.response === "string") {
+  if (!objects.length) return null;
+  const withStatus = objects.filter(
+    (o) => o && typeof o.status === "string"
+  );
+  if (withStatus.length) return withStatus[withStatus.length - 1];
+  return objects[objects.length - 1];
+}
+
+/**
+ * For stream-json: NDJSON lines; last event==="result" object's .result is envelope.
+ */
+function extractFromStreamJson(stdout) {
+  const lines = String(stdout || "").split(/\r?\n/);
+  let lastResult = null;
+  let lastResultEvent = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t[0] !== "{") continue;
+    let ev;
     try {
-      inner = JSON.parse(parsed.response);
+      ev = JSON.parse(t);
     } catch {
-      inner = {
-        status: parsed.status === "SUCCESS" ? "success" : "failed",
+      continue;
+    }
+    if (ev && ev.event === "result") {
+      lastResultEvent = ev;
+      if (ev.result != null && typeof ev.result === "object") {
+        lastResult = ev.result;
+      } else if (typeof ev.result === "string") {
+        lastResult = parseJsonLoose(ev.result) || { response: ev.result };
+      }
+    }
+  }
+  if (!lastResult && !lastResultEvent) {
+    return { ok: false, reason: "no_result_event" };
+  }
+  // Some emitters put fields on the event itself
+  if (!lastResult && lastResultEvent) {
+    const { event: _e, ...rest } = lastResultEvent;
+    lastResult = rest;
+  }
+  return { ok: true, parsed: lastResult, event: lastResultEvent };
+}
+
+function coerceInner(parsed) {
+  let structuredUsed = false;
+  let inner = null;
+
+  if (
+    parsed &&
+    parsed.structured_output != null &&
+    typeof parsed.structured_output === "object" &&
+    !Array.isArray(parsed.structured_output)
+  ) {
+    inner = parsed.structured_output;
+    structuredUsed = true;
+    return { inner, structuredUsed };
+  }
+
+  if (parsed && typeof parsed.response === "string") {
+    const cleaned = stripMarkdownFences(parsed.response);
+    const fromResp = parseJsonLoose(cleaned);
+    if (fromResp && typeof fromResp === "object") {
+      // nested structured_output inside response JSON
+      if (
+        fromResp.structured_output != null &&
+        typeof fromResp.structured_output === "object" &&
+        !Array.isArray(fromResp.structured_output)
+      ) {
+        return {
+          inner: fromResp.structured_output,
+          structuredUsed: true,
+        };
+      }
+      return { inner: fromResp, structuredUsed: false };
+    }
+    return {
+      inner: {
+        status: parsed.status === "SUCCESS" || parsed.status === "success"
+          ? "success"
+          : "failed",
         executive_summary: String(parsed.response).slice(0, 800),
         error_class: null,
         raw_response: true,
+      },
+      structuredUsed: false,
+    };
+  }
+
+  // parsed itself may already be the phase contract
+  if (parsed && typeof parsed === "object") {
+    inner = parsed;
+  }
+  return { inner, structuredUsed };
+}
+
+function parseAgyResult({
+  code,
+  stdout,
+  stderr,
+  duration_s,
+  meta,
+  timedOut,
+  outputFormat,
+}) {
+  let parsed = null;
+  let parseNote = null;
+
+  if (outputFormat === "stream-json") {
+    const extracted = extractFromStreamJson(stdout);
+    if (!extracted.ok) {
+      const errClass =
+        classifyError(stderr + stdout, code, timedOut) || "contract";
+      return {
+        ok: false,
+        errClass,
+        parsed: null,
+        inner: null,
+        envelope: {
+          status: "failed",
+          error_class: errClass,
+          message: "stream-json: no event===\"result\" in stdout",
+          exit_code: code,
+          duration_s,
+          stderr_tail: (stderr || "").slice(-2000),
+          stdout_tail: (stdout || "").slice(-2000),
+          ...meta,
+        },
+      };
+    }
+    parsed = extracted.parsed;
+    parseNote = "stream-json-result-event";
+  } else {
+    parsed = parseJsonLoose((stdout || "").trim());
+    if (!parsed) {
+      const errClass =
+        classifyError(stderr + stdout, code, timedOut) || "contract";
+      return {
+        ok: false,
+        errClass,
+        parsed: null,
+        inner: null,
+        envelope: {
+          status: "failed",
+          error_class: errClass,
+          message: "agy stdout was not valid JSON",
+          exit_code: code,
+          duration_s,
+          stderr_tail: (stderr || "").slice(-2000),
+          stdout_tail: (stdout || "").slice(-2000),
+          ...meta,
+        },
       };
     }
   }
+
+  const { inner, structuredUsed } = coerceInner(parsed);
 
   const blob = `${stderr || ""}\n${JSON.stringify(parsed)}`;
   const errClass =
@@ -605,14 +980,17 @@ function parseAgyResult({ code, stdout, stderr, duration_s, meta, timedOut }) {
     code === 0 &&
     (parsed?.status === "SUCCESS" ||
       parsed?.status === "success" ||
-      inner?.status === "success");
+      inner?.status === "success" ||
+      inner?.status === "SUCCESS" ||
+      inner?.status === "partial");
 
   const failedExplicit =
     parsed?.status === "ERROR" ||
     parsed?.status === "error" ||
-    inner?.status === "failed";
+    inner?.status === "failed" ||
+    inner?.status === "FAILED";
 
-  const ok = agyOk && !failedExplicit;
+  const ok = agyOk && !failedExplicit && inner != null;
 
   return {
     ok,
@@ -627,6 +1005,8 @@ function parseAgyResult({ code, stdout, stderr, duration_s, meta, timedOut }) {
       agy_status: parsed?.status ?? null,
       conversation_id: parsed?.conversation_id ?? null,
       result: inner,
+      structured_output_used: !!structuredUsed,
+      parse_note: parseNote,
       expected_topic_key: meta.expected_topic_key,
       gate_note:
         "Orchestrator MUST validate artifact in Engram/OpenSpec; stdout is not authority.",
@@ -676,6 +1056,16 @@ if (!agyPath) {
 
 let resolved = resolveModelEffort(cfg, args.phase, args.model, args.effort);
 const timeout = resolveTimeout(cfg, args.phase, args.timeout);
+const outputFormat = resolveOutputFormat(
+  cfg,
+  args.outputFormat,
+  args.outputFormatExplicit
+);
+const jsonSchemaPath = resolveJsonSchemaPath(
+  cfg,
+  args.jsonSchema,
+  args.jsonSchemaExplicit
+);
 
 const skillName = phaseSkillName(args.phase);
 const mainSkill = discoverSkill(cfg, args.cwd, skillName);
@@ -708,11 +1098,10 @@ if (!promptText) {
   });
 }
 
-const extra = cfg.workers?.agy?.extra_args || [
-  "--output-format",
-  "json",
+const rawExtra = cfg.workers?.agy?.extra_args || [
   "--dangerously-skip-permissions",
 ];
+const extra = mergeExtraArgs(rawExtra, outputFormat, jsonSchemaPath);
 
 const env = {
   ...process.env,
@@ -734,6 +1123,8 @@ function metaFor(resolvedPair, extraFields = {}) {
     skill_paths: skillPaths,
     expected_topic_key: artifactTopic(args.phase, args.change),
     artifact_store: args.artifactStore,
+    output_format: outputFormat,
+    json_schema_path: jsonSchemaPath,
     ...extraFields,
   };
 }
@@ -758,6 +1149,8 @@ if (args.dryRun) {
           i === 1 ? `<prompt ${promptText.length} chars>` : a
         ),
         normalization: resolved,
+        output_format: outputFormat,
+        json_schema_path: jsonSchemaPath,
         ...metaFor(resolved),
       },
       null,
@@ -773,12 +1166,14 @@ let attempt = await runAgyOnce({
   cliArgs,
   cwd: args.cwd,
   env,
+  streamProgress: args.streamProgress && outputFormat === "stream-json",
 });
 
 let timedOut = /timeout|deadline/i.test(attempt.stderr + attempt.stdout);
 let parsedAttempt = parseAgyResult({
   ...attempt,
   timedOut,
+  outputFormat,
   meta: metaFor(resolved, { attempt: 1 }),
 });
 
@@ -819,12 +1214,14 @@ if (
       cliArgs: retryArgs,
       cwd: args.cwd,
       env,
+      streamProgress: args.streamProgress && outputFormat === "stream-json",
     });
 
     timedOut = /timeout|deadline/i.test(attempt2.stderr + attempt2.stdout);
     parsedAttempt = parseAgyResult({
       ...attempt2,
       timedOut,
+      outputFormat,
       meta: metaFor(retryPair, {
         attempt: 2,
         retried_from: {

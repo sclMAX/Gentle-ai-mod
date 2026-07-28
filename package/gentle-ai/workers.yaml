@@ -3,6 +3,12 @@
 # Location: ~/.config/gentle-ai/workers.yaml
 # Optional project override: <repo>/.atl/sdd-workers.yaml (deep-merge over this file)
 #
+# v1.2 notes (structured output):
+# - output_format: json | stream-json  (CLI --output-format overrides)
+# - json_schema: default | none | <path>  (CLI --json-schema / --no-json-schema)
+# - Runner strips conflicting --output-format/--json-schema from extra_args, then appends.
+# - Default schema: ~/.config/gentle-ai/schemas/sdd-phase-result.schema.json
+#
 # v1.1 notes (agy model/effort):
 # - Gemini ids ending in -low|-medium|-high bake effort into the name.
 #   The runner aligns --effort to that suffix (never medium + *-high).
@@ -16,9 +22,11 @@ workers:
     enabled: true
     # Must be on PATH on every workstation
     command: agy
+    # Defaults for runner when CLI flags omitted (simple scalars — custom YAML parser)
+    output_format: json
+    json_schema: default
     extra_args:
-      - "--output-format"
-      - "json"
+      # Runner merges --output-format / --json-schema; keep permissions here
       - "--dangerously-skip-permissions"
     default_timeout: 10m
     plan_mode_explore: false
