@@ -43,7 +43,11 @@ const ELIGIBLE = new Set([
   "spec",
   "design",
   "tasks",
+  "apply",
   "verify",
+  "archive",
+  "init",
+  "onboard",
 ]);
 
 const EFFORT_LEVELS = new Set(["low", "medium", "high"]);
@@ -68,7 +72,7 @@ Usage:
   node run-agy-phase.mjs --phase <phase> --change <name> --project <proj> --cwd <repo> [options]
 
 Required:
-  --phase <name>           explore|propose|spec|design|tasks|verify
+  --phase <name>           explore|propose|spec|design|tasks|apply|verify|archive|init|onboard
   --change <name>          SDD change name
   --project <name>         Engram / project id
   --cwd <path>             repo working directory
@@ -564,14 +568,22 @@ function buildDefaultPrompt({
   skillPaths,
 }) {
   const skillBlock = skillPaths.map((p, i) => `${i + 1}. ${p}`).join("\n");
-  const topic =
-    phase === "explore"
-      ? "explore"
-      : phase === "propose"
-        ? "proposal"
-        : phase === "verify"
-          ? "verify-report"
-          : phase;
+  const topicKey =
+    phase === "init"
+      ? `sdd-init/${project}`
+      : `sdd/${change}/${
+          phase === "explore"
+            ? "explore"
+            : phase === "propose"
+              ? "proposal"
+              : phase === "verify"
+                ? "verify-report"
+                : phase === "apply"
+                  ? "apply-progress"
+                  : phase === "archive"
+                    ? "archive-report"
+                    : phase
+        }`;
   return `# ROLE
 You are the sdd-${phase} EXECUTOR (not orchestrator). Execute this single phase fully. Do NOT delegate. Do NOT orchestrate other SDD phases.
 
@@ -582,7 +594,7 @@ You are the sdd-${phase} EXECUTOR (not orchestrator). Execute this single phase 
 - project: ${project}
 - artifact_store.mode: ${artifactStore}
 - You MAY use Engram MCP tools with project: ${project}
-- You MUST NOT modify application source code unless phase is explicitly implementation (this runner forbids apply)
+- Source code rule: you MUST NOT modify application source code EXCEPT when phase is "apply" (implementation). For "apply" you MAY edit source files and run tests; NEVER run git commit/push in any phase.
 - You MUST NOT run git commit/push
 - You MUST NOT start other phases
 
@@ -593,7 +605,7 @@ ${skillBlock || "(none resolved — follow built-in Gentle SDD conventions)"}
 # PROJECT / MEMORY
 1. Prefer explicit project name: ${project} on every Engram call.
 2. Read required dependency artifacts for this phase from Engram/OpenSpec per SDD conventions.
-3. Persist this phase artifact with canonical topic_key sdd/${change}/${topic}
+3. Persist this phase artifact with canonical topic_key ${topicKey}
 
 # FINAL RESPONSE FORMAT
 Return structured output matching the json-schema when provided. Shape:
@@ -636,14 +648,18 @@ function phaseSkillName(phase) {
   return `sdd-${phase}`;
 }
 
-function artifactTopic(phase, change) {
+function artifactTopic(phase, change, project) {
+  if (phase === "init") return `sdd-init/${project}`;
   const map = {
     explore: "explore",
     propose: "proposal",
     spec: "spec",
     design: "design",
     tasks: "tasks",
+    apply: "apply-progress",
     verify: "verify-report",
+    archive: "archive-report",
+    onboard: "onboard",
   };
   return `sdd/${change}/${map[phase] || phase}`;
 }
@@ -1129,7 +1145,7 @@ function metaFor(resolvedPair, extraFields = {}) {
     timeout,
     agy_path: agyPath,
     skill_paths: skillPaths,
-    expected_topic_key: artifactTopic(args.phase, args.change),
+    expected_topic_key: artifactTopic(args.phase, args.change, args.project),
     artifact_store: args.artifactStore,
     output_format: outputFormat,
     json_schema_path: jsonSchemaPath,

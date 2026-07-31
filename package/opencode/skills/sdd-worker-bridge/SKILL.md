@@ -71,8 +71,8 @@ Include in `SDD Session Preflight` decision block as `worker_policy: ...`.
 
 ## Eligible phases
 
-**Eligible:** explore, propose, spec, design, tasks, verify  
-**Ineligible (always OpenCode):** apply, archive, init, onboard, review gates, commit/PR
+**Eligible (all SDD phases):** explore, propose, spec, design, tasks, apply, verify, archive, init, onboard  
+**Orchestrator-only (not SDD phases):** review lifecycle gates, commit/PR
 
 ## Phase launch algorithm (HARD GATE)
 
@@ -214,7 +214,7 @@ node /path/to/Gentle-ai-mod/install.mjs --check
 4. ≤1 profile question when applicable
 5. Store beats stdout
 6. No absolute cross-machine paths in committed config
-7. apply/archive never use agy in v1
+7. review lifecycle gates and commit/PR run on the orchestrator (OpenCode), never agy
 8. Dedup launches by `(phase, fingerprint)`
 
 ## Skill resolution note

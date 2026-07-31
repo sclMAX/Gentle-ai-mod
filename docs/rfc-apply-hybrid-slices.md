@@ -8,6 +8,13 @@
 | Depends on | Worker bridge v1.2 (json-schema, stream-json), agy ≥ 1.1.8, `sdd-apply` skill on agy |
 | Non-goal | Silent auto-delegation of apply to agy without a human choice |
 
+> **Status note (2026-07-31):** Implemented via the simple route — `apply` was added to
+> the runner's eligible phases and `workers.yaml` `policy.eligible` (source edits allowed
+> for `apply` only). The `--role apply-batch` / `implement-slice` roles, `apply-batch-result`
+> / `implement-slice-result` schemas, always-HITL apply worker question, and allowlist gate
+> from §7–§8 are **deferred**. Consequence: `prefer-agy` can now route `apply` to agy without
+> a human prompt. Commits/PR and review lifecycle remain orchestrator-only.
+
 ## 1. Problem
 
 SDD `apply` is the longest, highest-risk phase. Today it is **always OpenCode** (`sdd-apply`). Planning phases may run on agy. That splits cost/throughput while agy already has `sdd-apply` and strong headless contracts (1.1.8).

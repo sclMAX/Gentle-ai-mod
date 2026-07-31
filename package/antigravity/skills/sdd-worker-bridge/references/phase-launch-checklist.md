@@ -60,4 +60,4 @@ error_class: null | quota_exceeded | timeout | unavailable | contract | unknown
 
 ## H. Invariants
 
-One orchestrator · one worker at a time · store wins · ≤1 worker failover · apply not on agy v1
+One orchestrator · one worker at a time · store wins · ≤1 worker failover · review lifecycle + commit/PR stay on OpenCode

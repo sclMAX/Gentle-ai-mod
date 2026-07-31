@@ -23,8 +23,8 @@ Before launching any eligible SDD phase, follow the worker bridge. Load skill \`
 
 **Roles:** OpenCode \`gentle-orchestrator\` = only orchestrator. Workers: \`opencode\` (native \`task\` + \`sdd-<phase>\`) or \`agy\` (Antigravity CLI via runner). Workers never route the pipeline.
 
-**Eligible phases:** explore, propose, spec, design, tasks, verify.
-**Always OpenCode:** apply, archive, init, onboard, review lifecycle, commit/PR.
+**Eligible phases:** all SDD phases — explore, propose, spec, design, tasks, apply, verify, archive, init, onboard.
+**Always OpenCode (orchestrator-only):** review lifecycle, commit/PR.
 
 **Session state after preflight:**
 \`\`\`
@@ -52,7 +52,7 @@ session.agy_models (cached from \`agy models\` when available)
 
 **User overrides:** honor "use agy", "use opencode", model/effort phrases, and "try agy again" (clears exhausted).
 
-**Invariants:** one orchestrator; one worker at a time; store wins; apply never agy in v1; no cross-machine absolute paths; dedup launches.
+**Invariants:** one orchestrator; one worker at a time; store wins; commit/PR + review lifecycle stay on OpenCode; no cross-machine absolute paths; dedup launches.
 <!-- /gentle-ai:sdd-worker-bridge -->
 `;
 
