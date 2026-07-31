@@ -2,6 +2,19 @@
 /**
  * run-agy-phase — cross-platform SDD phase launcher for Antigravity CLI (agy)
  *
+ * v1.5:
+ *   - Live stderr progress by default on stream-json: lifecycle start line,
+ *     step RUNNING/DONE ticks with friendly labels, result event notice,
+ *     liveness heartbeat (120s) when no step event arrives
+ *   - --no-stream-progress disables ticks; workers.agy.stream_progress config
+ *     (default true) sets the default
+ *   - workers.yaml default output_format switched to stream-json
+ *
+ * v1.4:
+ *   - Native /sdd-<phase> skill expansion in print mode (agy >= 1.1.9)
+ *   - workers.agy.slash_command_skills / --slash-command-skills: auto|on|off
+ *   - off mode appends --disable-slash-commands on agy >= 1.1.9 (literal prompts)
+ *
  * v1.2:
  *   - Default --json-schema (sdd-phase-result.schema.json) + --output-format
  *   - Prefer structured_output; strip fences; stream-json NDJSON result event
@@ -23,7 +36,7 @@
  *   5 contract / invalid JSON from agy
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
@@ -52,6 +65,7 @@ const ELIGIBLE = new Set([
 
 const EFFORT_LEVELS = new Set(["low", "medium", "high"]);
 const OUTPUT_FORMATS = new Set(["json", "stream-json"]);
+const SLASH_MODES = new Set(["auto", "on", "off"]);
 
 function die(code, msg, extra = {}) {
   const envelope = {
@@ -88,7 +102,11 @@ Options:
   --output-format <fmt>    json|stream-json (default: json, or workers.yaml)
   --json-schema <spec>     path|default|none (default: default)
   --no-json-schema         alias for --json-schema none
-  --stream-progress        stderr progress for stream-json step_update DONE
+  --slash-command-skills <mode>
+                           auto|on|off native /sdd-<phase> skill expansion
+                           (default: auto — enabled when agy >= 1.1.9)
+  --stream-progress        stderr progress for stream-json step events (default: config, then on)
+  --no-stream-progress     disable stderr progress ticks even when stream-json
   --dry-run                print resolved CLI args and exit 0
   --json                   kept for compatibility (always JSON envelope)
   -h, --help               show help
@@ -114,7 +132,10 @@ function parseArgs(argv) {
     json: true,
     outputFormat: null, // null = use config default then json
     jsonSchema: null, // null = use config default then default
+    slashCommandSkills: null, // null = use config default then auto
+    slashCommandSkillsExplicit: false,
     streamProgress: false,
+    streamProgressExplicit: false,
     outputFormatExplicit: false,
     jsonSchemaExplicit: false,
   };
@@ -171,8 +192,19 @@ function parseArgs(argv) {
         out.jsonSchema = "none";
         out.jsonSchemaExplicit = true;
         break;
+      case "--slash-command-skills": {
+        const v = next();
+        out.slashCommandSkills = v;
+        out.slashCommandSkillsExplicit = true;
+        break;
+      }
       case "--stream-progress":
         out.streamProgress = true;
+        out.streamProgressExplicit = true;
+        break;
+      case "--no-stream-progress":
+        out.streamProgress = false;
+        out.streamProgressExplicit = true;
         break;
       case "--dry-run":
         out.dryRun = true;
@@ -334,6 +366,41 @@ function which(cmd) {
   return null;
 }
 
+/**
+ * Detect agy version via `agy --version` (e.g. "1.1.9").
+ * Returns { raw, major, minor, patch } or null on spawn/parse failure.
+ */
+function detectAgyVersion(agyPath) {
+  try {
+    const res = spawnSync(agyPath, ["--version"], {
+      timeout: 5000,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (res.error || res.status !== 0) return null;
+    const out = String(res.stdout || res.stderr || "").trim();
+    const m = out.match(/(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return null;
+    return {
+      raw: out,
+      major: Number(m[1]),
+      minor: Number(m[2]),
+      patch: Number(m[3]),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function versionAtLeast(v, major, minor, patch) {
+  if (!v) return false;
+  if (v.major > major) return true;
+  if (v.major < major) return false;
+  if (v.minor > minor) return true;
+  if (v.minor < minor) return false;
+  return v.patch >= patch;
+}
+
 /** Models whose id ends with -low|-medium|-high bake effort into the id. */
 function effortSuffixFromModel(model) {
   if (!model) return null;
@@ -493,6 +560,19 @@ function resolveOutputFormat(cfg, cliValue, explicit) {
 }
 
 /**
+ * Resolve stderr progress visibility.
+ * Config: workers.agy.stream_progress (default true).
+ * CLI: --stream-progress / --no-stream-progress override.
+ * Ticks only make sense with stream-json (step events arrive on stdout NDJSON).
+ */
+function resolveStreamProgress(cfg, cliValue, explicit) {
+  if (explicit) return !!cliValue;
+  const fromCfg = cfg.workers?.agy?.stream_progress;
+  if (fromCfg != null && fromCfg !== "") return !!fromCfg;
+  return true;
+}
+
+/**
  * Resolve json-schema path or null (disabled).
  * Spec: default | none | absolute/relative path
  */
@@ -534,13 +614,70 @@ function findDefaultSchemaPath() {
 }
 
 /**
- * Strip conflicting --output-format / --json-schema from extra_args, then append ours.
+ * Resolve slash-command skill expansion mode.
+ * auto: enabled when agy >= 1.1.9 (print-mode slash/skill expansion exists).
+ * on:   always prepend /sdd-<phase> (literal text on agy < 1.1.9).
+ * off:  never prepend; caller adds --disable-slash-commands on agy >= 1.1.9.
  */
-function mergeExtraArgs(extraArgs, outputFormat, jsonSchemaPath) {
+function resolveSlashCommandSkills(cfg, cliValue, explicit, version) {
+  let mode = "auto";
+  let source = "default";
+  if (explicit) {
+    mode = cliValue != null && cliValue !== "" ? String(cliValue).toLowerCase() : "auto";
+    source = "cli";
+  } else if (cfg.workers?.agy?.slash_command_skills != null) {
+    mode = String(cfg.workers.agy.slash_command_skills).toLowerCase();
+    source = "config";
+  }
+  if (!SLASH_MODES.has(mode)) {
+    const label = source === "cli" ? "--slash-command-skills" : "workers.agy.slash_command_skills";
+    die(2, `Invalid ${label}: ${mode} (use auto|on|off)`);
+  }
+
+  const hasFeature = versionAtLeast(version, 1, 1, 9);
+  let enabled;
+  let note = null;
+  if (mode === "on") {
+    enabled = true;
+    if (!hasFeature) {
+      note = version
+        ? `slash expansion requires agy >= 1.1.9 (found ${version.raw}); /sdd-<phase> sent as literal text`
+        : "slash expansion requires agy >= 1.1.9 (version undetectable); /sdd-<phase> sent as literal text";
+    }
+  } else if (mode === "off") {
+    enabled = false;
+  } else {
+    // auto
+    if (hasFeature) {
+      enabled = true;
+    } else {
+      enabled = false;
+      note = version
+        ? `agy ${version.raw} < 1.1.9; slash expansion disabled`
+        : "agy version undetectable; slash expansion disabled";
+    }
+  }
+  return {
+    mode,
+    source,
+    enabled,
+    has_feature: hasFeature,
+    agy_version: version ? version.raw : null,
+    note,
+  };
+}
+
+/**
+ * Strip conflicting --output-format / --json-schema / --disable-slash-commands
+ * from extra_args, then append ours. --disable-slash-commands is a boolean flag
+ * (no value) and is only appended when slashDisabled is true.
+ */
+function mergeExtraArgs(extraArgs, outputFormat, jsonSchemaPath, slashDisabled) {
   const base = Array.isArray(extraArgs) ? [...extraArgs] : [];
   const cleaned = [];
   for (let i = 0; i < base.length; i++) {
     const a = base[i];
+    if (a === "--disable-slash-commands") continue; // boolean flag, no value
     if (a === "--output-format" || a === "--json-schema") {
       i += 1; // skip value
       continue;
@@ -556,6 +693,9 @@ function mergeExtraArgs(extraArgs, outputFormat, jsonSchemaPath) {
   cleaned.push("--output-format", outputFormat);
   if (jsonSchemaPath) {
     cleaned.push("--json-schema", jsonSchemaPath);
+  }
+  if (slashDisabled) {
+    cleaned.push("--disable-slash-commands");
   }
   return cleaned;
 }
@@ -664,6 +804,37 @@ function artifactTopic(phase, change, project) {
   return `sdd/${change}/${map[phase] || phase}`;
 }
 
+/**
+ * Roots where agy scans skills natively (the installer mirrors sdd-* skills here).
+ */
+function agySkillRoots() {
+  const home = homedir();
+  return [
+    join(home, ".gemini", "antigravity-cli", "skills"),
+    join(home, ".gemini", "antigravity", "skills"),
+  ];
+}
+
+/**
+ * True when a skill with this name exists in an agy-scanned root, so the native
+ * /sdd-<phase> expansion can actually load it (mirror may exist even when the
+ * runner discovered the opencode copy first).
+ */
+function skillIsAvailableToAgy(name) {
+  return agySkillRoots().some((root) => existsSync(join(root, name, "SKILL.md")));
+}
+
+/**
+ * Prepend the native phase skill command to a print-mode prompt.
+ * Prompts that already start with "/" are left untouched (no command stacking).
+ */
+function applySkillExpansion(promptText, phase, enabled) {
+  if (!enabled) return promptText;
+  const s = String(promptText || "");
+  if (s.trimStart().startsWith("/")) return s;
+  return `/sdd-${phase}\n${s}`;
+}
+
 function buildCliArgs({
   promptText,
   timeout,
@@ -683,7 +854,37 @@ function buildCliArgs({
   return cliArgs;
 }
 
-function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
+/**
+ * Friendly labels for agy stream-json step_type values observed on 1.1.9:
+ * user_input, agent_response, unknown, error_message, plus common tool types.
+ */
+const STEP_TYPE_LABELS = {
+  user_input: "prompt received",
+  agent_response: "generating response",
+  unknown: "working",
+  error_message: "error",
+  tool_use: "tool call",
+  tool_call: "tool call",
+  run_command: "running command",
+  send_command_input: "sending input to command",
+  read_file: "reading file",
+  view_file: "reading file",
+  list_dir: "listing directory",
+  write_to_file: "writing file",
+  replace_file_content: "writing file",
+  multi_replace_file_content: "writing files",
+  sed_file: "editing file",
+  grep_search: "searching",
+  search_web: "searching web",
+  read_url_content: "reading URL",
+  ask_permission: "asking permission",
+  ask_question: "asking question",
+  invoke_subagent: "invoking subagent",
+  manage_task: "managing task",
+  finish: "finishing",
+};
+
+function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 0 }) {
   return new Promise((resolvePromise) => {
     const started = Date.now();
     const child = spawn(agyPath, cliArgs, {
@@ -696,30 +897,58 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
     let stdout = "";
     let stderr = "";
     let progressLineBuf = "";
+    let lastProgressAt = Date.now();
+    let heartbeat = null;
+
+    const fmtElapsed = (ms) => {
+      const total = Math.floor(ms / 1000);
+      const m = Math.floor(total / 60);
+      return m > 0 ? `${m}m ${total % 60}s` : `${total}s`;
+    };
+    const progress = (line) => {
+      process.stderr.write(`[agy] ${line}\n`);
+      lastProgressAt = Date.now();
+    };
+
+    if (heartbeatMs > 0) {
+      heartbeat = setInterval(() => {
+        if (Date.now() - lastProgressAt >= heartbeatMs) {
+          progress(`still running (${fmtElapsed(Date.now() - started)})`);
+        }
+      }, Math.min(heartbeatMs, 30000));
+    }
+
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => {
       const chunk = String(d);
       stdout += chunk;
       if (streamProgress) {
-        // agy 1.1.8 NDJSON: {"event":"step_update","step_update":{"state":"DONE","step_type":"..."}}
-        // Buffer across chunks so partial lines are not dropped.
+        // agy 1.1.8+ NDJSON: {"event":"step_update","step_update":{...}},
+        // {"event":"result","result":{...}}. Buffer across chunks so partial
+        // lines are not dropped.
         progressLineBuf += chunk;
         const parts = progressLineBuf.split(/\r?\n/);
         progressLineBuf = parts.pop() || "";
         for (const line of parts) {
           const t = line.trim();
           if (!t.startsWith("{")) continue;
+          let ev;
           try {
-            const ev = JSON.parse(t);
-            if (!ev || ev.event !== "step_update") continue;
+            ev = JSON.parse(t);
+          } catch {
+            continue; // partial / non-json
+          }
+          if (!ev || typeof ev !== "object") continue;
+
+          if (ev.event === "step_update") {
             const su =
               ev.step_update && typeof ev.step_update === "object"
                 ? ev.step_update
                 : ev;
             const state = String(su.state || su.status || ev.state || "").toUpperCase();
-            if (state !== "DONE") continue;
-            const label =
+            const idx = su.step_index != null ? ` ${su.step_index}` : "";
+            const rawType =
               su.step_type ||
               su.step ||
               su.name ||
@@ -727,11 +956,17 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
               su.message ||
               ev.step_type ||
               ev.step ||
-              (su.step_index != null ? `step_${su.step_index}` : null) ||
               "step";
-            process.stderr.write(`[agy] step done: ${label}\n`);
-          } catch {
-            /* ignore partial / non-json */
+            const label = STEP_TYPE_LABELS[rawType] || String(rawType);
+            if (state === "DONE") {
+              progress(`step${idx} done: ${label}`);
+            } else if (["RUNNING", "IN_PROGRESS", "START", "PENDING"].includes(state)) {
+              progress(`step${idx}: ${label}…`);
+            } else if (state === "ERROR" || state === "FAILED") {
+              progress(`step${idx} error: ${label}`);
+            }
+          } else if (ev.event === "result") {
+            progress("result received — finalizing…");
           }
         }
       }
@@ -741,6 +976,7 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
     });
 
     child.on("error", (err) => {
+      if (heartbeat) clearInterval(heartbeat);
       resolvePromise({
         code: 127,
         stdout,
@@ -751,6 +987,7 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress }) {
     });
 
     child.on("close", (code) => {
+      if (heartbeat) clearInterval(heartbeat);
       resolvePromise({
         code,
         stdout,
@@ -1078,6 +1315,14 @@ if (!agyPath) {
   });
 }
 
+const agyVersion = detectAgyVersion(agyPath);
+const slashCfg = resolveSlashCommandSkills(
+  cfg,
+  args.slashCommandSkills,
+  args.slashCommandSkillsExplicit,
+  agyVersion
+);
+
 let resolved = resolveModelEffort(cfg, args.phase, args.model, args.effort);
 const timeout = resolveTimeout(cfg, args.phase, args.timeout);
 const outputFormat = resolveOutputFormat(
@@ -1085,6 +1330,10 @@ const outputFormat = resolveOutputFormat(
   args.outputFormat,
   args.outputFormatExplicit
 );
+const progressEnabled =
+  resolveStreamProgress(cfg, args.streamProgress, args.streamProgressExplicit) &&
+  outputFormat === "stream-json";
+const heartbeatMs = 120000;
 const jsonSchemaPath = resolveJsonSchemaPath(
   cfg,
   args.jsonSchema,
@@ -1094,7 +1343,7 @@ const jsonSchemaPath = resolveJsonSchemaPath(
 const skillName = phaseSkillName(args.phase);
 const mainSkill = discoverSkill(cfg, args.cwd, skillName);
 const shared = discoverSkill(cfg, args.cwd, "_shared");
-const skillPaths = [];
+let skillPaths = [];
 if (mainSkill) skillPaths.push(mainSkill);
 if (shared) {
   const sharedParent = resolve(String(shared).replace(/SKILL\.md$/, ""));
@@ -1104,6 +1353,12 @@ if (shared) {
   ]) {
     if (existsSync(f) && !skillPaths.includes(f)) skillPaths.push(f);
   }
+}
+// Native /sdd-<phase> expansion loads the main skill itself; drop the redundant
+// read-block entry when the skill exists in an agy-scanned root (mirrored) and
+// the feature is actually active. _shared references stay (not slash commands).
+if (slashCfg.enabled && slashCfg.has_feature && skillIsAvailableToAgy(skillName)) {
+  skillPaths = skillPaths.filter((p) => p !== mainSkill);
 }
 
 let promptText = args.prompt;
@@ -1121,11 +1376,15 @@ if (!promptText) {
     skillPaths,
   });
 }
+promptText = applySkillExpansion(promptText, args.phase, slashCfg.enabled);
 
 const rawExtra = cfg.workers?.agy?.extra_args || [
   "--dangerously-skip-permissions",
 ];
-const extra = mergeExtraArgs(rawExtra, outputFormat, jsonSchemaPath);
+// Append --disable-slash-commands only when expansion is off AND agy has the flag
+// (>= 1.1.9); older builds already send prompts literally.
+const slashDisabled = !slashCfg.enabled && slashCfg.has_feature;
+const extra = mergeExtraArgs(rawExtra, outputFormat, jsonSchemaPath, slashDisabled);
 
 const env = {
   ...process.env,
@@ -1149,6 +1408,7 @@ function metaFor(resolvedPair, extraFields = {}) {
     artifact_store: args.artifactStore,
     output_format: outputFormat,
     json_schema_path: jsonSchemaPath,
+    slash_command_skills: slashCfg,
     ...extraFields,
   };
 }
@@ -1185,12 +1445,18 @@ if (args.dryRun) {
 }
 
 const t0 = Date.now();
+process.stderr.write(
+  `[agy] sdd-${args.phase} start (${resolved.model || "default model"}${
+    resolved.effort ? `, effort ${resolved.effort}` : ""
+  }, timeout ${timeout})\n`
+);
 let attempt = await runAgyOnce({
   agyPath,
   cliArgs,
   cwd: args.cwd,
   env,
-  streamProgress: args.streamProgress && outputFormat === "stream-json",
+  streamProgress: progressEnabled,
+  heartbeatMs,
 });
 
 let timedOut = /timeout|deadline/i.test(attempt.stderr + attempt.stdout);
@@ -1223,6 +1489,11 @@ if (
     retryPair.effort === resolved.effort;
 
   if (retryPair && !same) {
+    process.stderr.write(
+      `[agy] retry attempt 2 (${retryPair.model || "default model"}${
+        retryPair.effort ? `, effort ${retryPair.effort}` : ""
+      })\n`
+    );
     const retryArgs = buildCliArgs({
       promptText,
       timeout,
@@ -1238,7 +1509,8 @@ if (
       cliArgs: retryArgs,
       cwd: args.cwd,
       env,
-      streamProgress: args.streamProgress && outputFormat === "stream-json",
+      streamProgress: progressEnabled,
+      heartbeatMs,
     });
 
     timedOut = /timeout|deadline/i.test(attempt2.stderr + attempt2.stdout);

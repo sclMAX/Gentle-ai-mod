@@ -28,8 +28,9 @@ Orchestrator decision procedure. Run before every SDD phase.
 ### agy
 
 - [ ] Write prompt file
+- [ ] Verify `sdd-<phase>` SKILL.md exists in an agy-scanned root (`~/.gemini/antigravity-cli/skills/`) when `slash_command_skills` is `auto`/`on` — runner prepends `/sdd-<phase>` on agy ≥ 1.1.9
 - [ ] `node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase ... --change ... --project ... --cwd ... --prompt-file ... [--model] [--effort]`
-- [ ] Parse JSON envelope from stdout
+- [ ] Parse JSON envelope from stdout (meta includes `slash_command_skills`)
 
 ## D. Normalize
 

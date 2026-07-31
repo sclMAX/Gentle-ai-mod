@@ -19,6 +19,18 @@
 # edit source files; commits/PR and review lifecycle remain orchestrator-only.
 # The RFC design (docs/rfc-apply-hybrid-slices.md: --role apply-batch, HITL prompt,
 # allowlist scope, apply-batch-result schema) is deferred.
+#
+# v1.5 note (2026-07-31): live stderr progress on stream-json.
+# - output_format default switched to stream-json (step_update/result NDJSON).
+# - stream_progress: true (default) prints [agy] lifecycle, step ticks and
+#   heartbeat to stderr; --no-stream-progress on the runner disables ticks.
+# - Stdout envelope contract unchanged: final JSON is parsed from the result event.
+#
+# v1.4 note (2026-07-31): native /sdd-<phase> skill expansion in print mode.
+# - slash_command_skills: auto|on|off (CLI --slash-command-skills overrides)
+# - auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands on >= 1.1.9)
+# - Runner drops the main SKILL.md from the read block when the skill is mirrored
+#   to an agy-scanned root (~/.gemini/antigravity-cli/skills or ~/.gemini/antigravity/skills).
 
 version: 1
 
@@ -28,8 +40,13 @@ workers:
     # Must be on PATH on every workstation
     command: agy
     # Defaults for runner when CLI flags omitted (simple scalars — custom YAML parser)
-    output_format: json
+    output_format: stream-json
     json_schema: default
+    # stderr progress ticks + heartbeat (runner --no-stream-progress to disable)
+    stream_progress: true
+    # auto|on|off — native /sdd-<phase> skill expansion in print mode.
+    # auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands).
+    slash_command_skills: auto
     extra_args:
       # Runner merges --output-format / --json-schema; keep permissions here
       - "--dangerously-skip-permissions"

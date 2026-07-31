@@ -109,15 +109,25 @@ node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
   --effort medium
 ```
 
-Runner v1.2 flags (defaults from `workers.yaml` when omitted):
+Runner v1.5 flags (defaults from `workers.yaml` when omitted):
 
 ```text
---output-format json|stream-json   # default json
+--output-format json|stream-json   # default stream-json
 --json-schema default|none|<path>  # default: shipped sdd-phase-result schema
 --no-json-schema                   # alias for --json-schema none
---stream-progress                  # stderr step DONE lines (stream-json only)
+--slash-command-skills auto|on|off # native /sdd-<phase> skill expansion (default auto)
+--stream-progress                  # stderr progress ticks (default: config, then on)
+--no-stream-progress               # disable stderr progress ticks even when stream-json
 --dry-run                          # print final CLI args (includes format + schema path)
 ```
+
+`slash_command_skills: auto` (default) prepends `/sdd-<phase>` to the agy print prompt
+when agy ≥ 1.1.9, so the phase skill is resolved and applied natively instead of being
+read as a file. Requires the `sdd-<phase>` skill mirrored to an agy-scanned root
+(`~/.gemini/antigravity-cli/skills/`, done by the installer). `off` keeps literal
+prompts and appends `--disable-slash-commands` on agy ≥ 1.1.9 (also protects prompts
+starting with `/`, e.g. absolute paths). Prompts that already start with `/` are never
+prepended.
 
 Re-apply orchestrator patch after a Gentle/OpenCode upgrade overwrites prompts:
 
@@ -139,6 +149,20 @@ cd Gentle-ai-mod && git pull && node install.mjs
 ---
 
 ## Changelog
+
+### v1.5
+
+- **Runner:** live stderr progress by default on stream-json — `[agy]` lifecycle start line, step RUNNING/DONE ticks with friendly labels, `result received` notice, and a liveness heartbeat (120s) when no step event arrives
+- **Runner:** `--no-stream-progress` disables ticks; `workers.agy.stream_progress` (default `true`) sets the default
+- **Config:** `workers.agy.output_format` default switched `json` → `stream-json` (stdout envelope contract unchanged)
+- **README:** flags block + changelog updated to match
+
+### v1.4
+
+- **Runner:** native `/sdd-<phase>` skill expansion in print mode (agy ≥ 1.1.9) — phase skill loads via slash command instead of a file read
+- **Runner:** `workers.agy.slash_command_skills` / `--slash-command-skills auto|on|off`; `off` appends `--disable-slash-commands` on agy ≥ 1.1.9
+- **Runner:** `agy --version` detection; envelope meta gains `slash_command_skills`
+- **Config:** `workers.agy.slash_command_skills: auto` default
 
 ### v1.2
 

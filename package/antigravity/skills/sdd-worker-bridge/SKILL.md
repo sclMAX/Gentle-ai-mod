@@ -200,6 +200,24 @@ Runner defaults (overridable via CLI or `workers.agy`):
 
 Parsing prefers `structured_output` object; else strips markdown fences from `response` and JSON-parses. Envelope includes `output_format`, `json_schema_path`, `structured_output_used`.
 
+## Native skill expansion (v1.4)
+
+The runner prepends the phase skill as a slash command in print mode, so agy resolves and applies it natively instead of the model reading `SKILL.md` as a file:
+
+| Mode (`workers.agy.slash_command_skills` / `--slash-command-skills`) | Behavior |
+|------|----------|
+| `auto` (default) | Prepend `/sdd-<phase>` when agy ≥ 1.1.9; literal prompts below |
+| `on` | Always prepend (sent as literal text on agy < 1.1.9) |
+| `off` | Never prepend; appends `--disable-slash-commands` on agy ≥ 1.1.9 |
+
+Requirements / notes:
+
+- The `sdd-<phase>` skill must be installed where agy scans skills (installer mirrors it to `~/.gemini/antigravity-cli/skills/`).
+- When the skill is mirrored to an agy-scanned root, the runner drops it from the "read these files" block (native load replaces the file read); `_shared` references are still listed.
+- Custom prompts that already start with `/` are left untouched (no command stacking).
+- `off` also protects prompts starting with `/` (e.g. absolute paths) from being parsed as commands.
+- Envelope meta includes `slash_command_skills: { mode, source, enabled, has_feature, agy_version, note }`.
+
 Health after install:
 
 ```bash
