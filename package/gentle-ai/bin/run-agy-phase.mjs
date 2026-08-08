@@ -2,6 +2,23 @@
 /**
  * run-agy-phase — cross-platform SDD phase launcher for Antigravity CLI (agy)
  *
+ * v1.7:
+ *   - --stderr-log <path>; workers.agy.stderr_log config (templates {config}
+ *     {home} {cwd} {phase} {change} {project}) redirects the verbose progress
+ *     stream (ticks + text_delta) to a file instead of stderr, so the
+ *     orchestrator's bash tool result stays small. A single notice line
+ *     "[agy] progress log: <path>" still goes to stderr; the envelope meta
+ *     includes stderr_log_path for the orchestrator to surface a link.
+ *
+ * v1.6:
+ *   - --stream-progress-detail summary|tools|full; workers.agy.stream_progress_detail
+ *     config (default summary)
+ *     summary: friendly label only (previous behavior)
+ *     tools:   + tool name and key parameters (run_command -> CommandLine, etc.)
+ *     full:    tools + live text_delta streaming of the model response +
+ *              duration/tokens when each step closes
+ *   - Envelope meta includes stream_progress_detail
+ *
  * v1.5:
  *   - Live stderr progress by default on stream-json: lifecycle start line,
  *     step RUNNING/DONE ticks with friendly labels, result event notice,
@@ -40,7 +57,9 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
+  createWriteStream,
   existsSync,
+  mkdirSync,
   readFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -66,6 +85,7 @@ const ELIGIBLE = new Set([
 const EFFORT_LEVELS = new Set(["low", "medium", "high"]);
 const OUTPUT_FORMATS = new Set(["json", "stream-json"]);
 const SLASH_MODES = new Set(["auto", "on", "off"]);
+const STREAM_DETAIL_LEVELS = new Set(["summary", "tools", "full"]);
 
 function die(code, msg, extra = {}) {
   const envelope = {
@@ -107,6 +127,13 @@ Options:
                            (default: auto — enabled when agy >= 1.1.9)
   --stream-progress        stderr progress for stream-json step events (default: config, then on)
   --no-stream-progress     disable stderr progress ticks even when stream-json
+  --stream-progress-detail <level>
+                           summary|tools|full (default: config, then summary)
+                           summary = friendly label only
+                           tools   = + tool name and key parameters
+                           full    = tools + live model text_delta + duration/tokens
+  --stderr-log <path>      write verbose progress to this file instead of stderr
+                           (templates: {config} {home} {cwd} {phase} {change} {project})
   --dry-run                print resolved CLI args and exit 0
   --json                   kept for compatibility (always JSON envelope)
   -h, --help               show help
@@ -136,6 +163,10 @@ function parseArgs(argv) {
     slashCommandSkillsExplicit: false,
     streamProgress: false,
     streamProgressExplicit: false,
+    streamProgressDetail: null, // null = use config default then summary
+    streamProgressDetailExplicit: false,
+    stderrLog: null, // null = use config default then disabled
+    stderrLogExplicit: false,
     outputFormatExplicit: false,
     jsonSchemaExplicit: false,
   };
@@ -206,6 +237,18 @@ function parseArgs(argv) {
         out.streamProgress = false;
         out.streamProgressExplicit = true;
         break;
+      case "--stream-progress-detail": {
+        const v = next();
+        out.streamProgressDetail = v;
+        out.streamProgressDetailExplicit = true;
+        break;
+      }
+      case "--stderr-log": {
+        const v = next();
+        out.stderrLog = v;
+        out.stderrLogExplicit = true;
+        break;
+      }
       case "--dry-run":
         out.dryRun = true;
         break;
@@ -573,6 +616,63 @@ function resolveStreamProgress(cfg, cliValue, explicit) {
 }
 
 /**
+ * Resolve stderr-log target path or null (disabled).
+ * Config: workers.agy.stderr_log (may use templates).
+ * CLI: --stderr-log overrides.
+ * Templates: {config} {home} {cwd} {phase} {change} {project}
+ */
+function resolveStderrLog(cfg, cliValue, explicit, vars) {
+  let spec = null;
+  let source = "default";
+  if (explicit) {
+    spec = cliValue != null && cliValue !== "" ? String(cliValue) : null;
+    source = "cli";
+  } else if (cfg.workers?.agy?.stderr_log != null) {
+    spec = String(cfg.workers.agy.stderr_log);
+    source = "config";
+  }
+  if (!spec || spec === "off" || spec === "none" || spec === "false") {
+    return { path: null, source };
+  }
+  const expanded = String(spec)
+    .replaceAll("{config}", join(homedir(), ".config", "gentle-ai"))
+    .replaceAll("{home}", homedir())
+    .replaceAll("{cwd}", vars.cwd)
+    .replaceAll("{phase}", vars.phase)
+    .replaceAll("{change}", vars.change)
+    .replaceAll("{project}", vars.project)
+    .replace(/^~(?=$|\/|\\)/, homedir());
+  const abs = resolve(expanded);
+  return { path: abs, source };
+}
+
+/**
+ * Resolve stream-progress detail level.
+ * Config: workers.agy.stream_progress_detail (default "summary").
+ * CLI: --stream-progress-detail overrides.
+ * Levels: summary | tools | full
+ */
+function resolveStreamProgressDetail(cfg, cliValue, explicit) {
+  let level = "summary";
+  let source = "default";
+  if (explicit) {
+    level = String(cliValue).toLowerCase();
+    source = "cli";
+  } else if (cfg.workers?.agy?.stream_progress_detail != null) {
+    level = String(cfg.workers.agy.stream_progress_detail).toLowerCase();
+    source = "config";
+  }
+  if (!STREAM_DETAIL_LEVELS.has(level)) {
+    const label =
+      source === "cli"
+        ? "--stream-progress-detail"
+        : "workers.agy.stream_progress_detail";
+    die(2, `Invalid ${label}: ${level} (use summary|tools|full)`);
+  }
+  return { level, source };
+}
+
+/**
  * Resolve json-schema path or null (disabled).
  * Spec: default | none | absolute/relative path
  */
@@ -884,7 +984,134 @@ const STEP_TYPE_LABELS = {
   finish: "finishing",
 };
 
-function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 0 }) {
+/**
+ * Extract a readable tool label from a step_update event.
+ * agy 1.1.10+ sends tools as { step_type: "tool", tool_name: "run_command",
+ * tool_info: { name, parameters, output } }; older builds used the bare
+ * step_type as the tool name. Returns null when the step is not a tool.
+ */
+function toolLabelFromStep(su) {
+  const isTool =
+    su.step_type === "tool" ||
+    su.step_type === "tool_use" ||
+    su.step_type === "tool_call";
+  if (isTool) {
+    return (
+      su.tool_name ||
+      su.tool_info?.name ||
+      su.tool ||
+      su.name ||
+      null
+    );
+  }
+  return null;
+}
+
+/**
+ * Extract the most informative single parameter from a tool step for the
+ * progress line. Returns a short string or null.
+ */
+function toolParamFromStep(su) {
+  const name = toolLabelFromStep(su) || su.step_type;
+  const params = su.tool_info?.parameters || su.parameters || {};
+  if (typeof params !== "object" || params === null) return null;
+
+  const first = (keys) => {
+    for (const k of keys) {
+      const v = params[k];
+      if (v !== undefined && v !== null && v !== "") return v;
+    }
+    return null;
+  };
+
+  const compact = (v) => {
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    if (!s) return null;
+    const one = s.replace(/\s+/g, " ").trim();
+    return one.length > 120 ? one.slice(0, 117) + "..." : one;
+  };
+
+  switch (name) {
+    case "run_command":
+    case "send_command_input":
+      return compact(first(["CommandLine", "command", "cmd"]));
+    case "write_to_file":
+    case "replace_file_content":
+    case "view_file":
+    case "read_file":
+    case "sed_file":
+      return compact(first(["FilePath", "filePath", "path", "file"]));
+    case "multi_replace_file_content": {
+      const files = first(["Files", "files"]);
+      if (Array.isArray(files)) return `${files.length} files`;
+      if (params.files && typeof params.files === "object") {
+        return `${Object.keys(params.files).length} files`;
+      }
+      return null;
+    }
+    case "grep_search":
+    case "search_web":
+      return compact(first(["Pattern", "Query", "query", "pattern"]));
+    case "invoke_subagent":
+      return compact(first(["SubagentName", "AgentName", "name", "agent"]));
+    case "manage_task":
+      return compact(first(["Action", "action", "Task", "task"]));
+    case "call_mcp_tool":
+      return compact(first(["ToolName", "toolName", "tool"]));
+    case "read_url_content":
+    case "open_browser_url":
+      return compact(first(["Url", "url"]));
+    case "list_dir":
+      return compact(first(["Path", "path"]));
+    default:
+      return null;
+  }
+}
+
+/**
+ * Human label for a step: for tools, "tool_name: param"; otherwise the
+ * STEP_TYPE_LABELS mapping (falling back to the raw step_type).
+ */
+function stepLabel(su, detail) {
+  const tool = toolLabelFromStep(su);
+  if (tool && detail !== "summary") {
+    const param = toolParamFromStep(su);
+    const base = STEP_TYPE_LABELS[tool] || tool;
+    return param ? `${base}: ${param}` : base;
+  }
+  const rawType =
+    su.step_type || su.step || su.name || su.title || su.message || "step";
+  return STEP_TYPE_LABELS[rawType] || String(rawType);
+}
+
+function fmtTokens(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const total = usage.total_tokens;
+  if (total == null) return null;
+  return `${Number(total).toLocaleString("en-US")} tok`;
+}
+
+function fmtDuration(seconds) {
+  if (seconds == null) return null;
+  const s = Number(seconds);
+  if (!Number.isFinite(s)) return null;
+  if (s >= 60) {
+    const m = Math.floor(s / 60);
+    return `${m}m ${Math.round(s % 60)}s`;
+  }
+  return `${s.toFixed(1)}s`;
+}
+
+function runAgyOnce({
+  agyPath,
+  cliArgs,
+  cwd,
+  env,
+  streamProgress,
+  streamDetail,
+  stderrLogPath: logPath,
+  heartbeatMs = 0,
+}) {
   return new Promise((resolvePromise) => {
     const started = Date.now();
     const child = spawn(agyPath, cliArgs, {
@@ -899,20 +1126,62 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 
     let progressLineBuf = "";
     let lastProgressAt = Date.now();
     let heartbeat = null;
+    // Streamed-text bookkeeping: keep a single line open for text_delta,
+    // and remember which step indexes already streamed their text so the
+    // DONE event does not repeat it.
+    let streamOpen = false;
+    const streamedIndexes = new Set();
+
+    // Optional verbose progress sink: file (append) instead of stderr so the
+    // orchestrator's bash tool result stays small. Error handling is passive:
+    // if the file cannot be opened we fall back to stderr.
+    let logStream = null;
+    try {
+      if (logPath) {
+        mkdirSync(dirname(logPath), { recursive: true });
+        logStream = createWriteStream(logPath, { flags: "a" });
+      }
+    } catch {
+      logStream = null;
+    }
 
     const fmtElapsed = (ms) => {
       const total = Math.floor(ms / 1000);
       const m = Math.floor(total / 60);
       return m > 0 ? `${m}m ${total % 60}s` : `${total}s`;
     };
+    const emitLine = (line) => {
+      const text = `[agy] ${line}\n`;
+      if (logStream) logStream.write(text);
+      else process.stderr.write(text);
+    };
     const progress = (line) => {
-      process.stderr.write(`[agy] ${line}\n`);
+      if (streamOpen) {
+        emitLine("");
+        streamOpen = false;
+      }
+      emitLine(line);
       lastProgressAt = Date.now();
+    };
+    const progressStream = (text) => {
+      const s = String(text || "");
+      if (!s) return;
+      if (logStream) logStream.write(s);
+      else process.stderr.write(s);
+      streamOpen = !s.endsWith("\n");
+      lastProgressAt = Date.now();
+    };
+    const maybeCloseStream = () => {
+      if (streamOpen) {
+        emitLine("");
+        streamOpen = false;
+      }
     };
 
     if (heartbeatMs > 0) {
       heartbeat = setInterval(() => {
         if (Date.now() - lastProgressAt >= heartbeatMs) {
+          maybeCloseStream();
           progress(`still running (${fmtElapsed(Date.now() - started)})`);
         }
       }, Math.min(heartbeatMs, 30000));
@@ -948,24 +1217,50 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 
                 : ev;
             const state = String(su.state || su.status || ev.state || "").toUpperCase();
             const idx = su.step_index != null ? ` ${su.step_index}` : "";
-            const rawType =
-              su.step_type ||
-              su.step ||
-              su.name ||
-              su.title ||
-              su.message ||
-              ev.step_type ||
-              ev.step ||
-              "step";
-            const label = STEP_TYPE_LABELS[rawType] || String(rawType);
+            const label = stepLabel(su, streamDetail);
+            const tokens = fmtTokens(su.usage);
+            const dur = fmtDuration(su.duration_seconds);
+
             if (state === "DONE") {
-              progress(`step${idx} done: ${label}`);
-            } else if (["RUNNING", "IN_PROGRESS", "START", "PENDING"].includes(state)) {
+              // full mode: if the final text arrived only in this DONE event
+              // (agy sometimes emits deltas only here), stream it now.
+              if (
+                streamDetail === "full" &&
+                su.text_delta &&
+                su.step_index != null &&
+                !streamedIndexes.has(su.step_index)
+              ) {
+                progressStream(su.text_delta);
+                streamedIndexes.add(su.step_index);
+              }
+              maybeCloseStream();
+              let done = `step${idx} done: ${label}`;
+              const extras = [];
+              if (dur) extras.push(dur);
+              if (tokens && streamDetail === "full") extras.push(tokens);
+              if (extras.length) done += ` (${extras.join(", ")})`;
+              progress(done);
+            } else if (["RUNNING", "IN_PROGRESS", "START", "PENDING", "ACTIVE"].includes(state)) {
+              // full mode: stream the model's response text live
+              if (
+                streamDetail === "full" &&
+                (su.step_type === "agent_response" ||
+                  su.step_type === "unknown") &&
+                su.text_delta &&
+                !streamedIndexes.has(su.step_index)
+              ) {
+                progressStream(su.text_delta);
+                if (su.step_index != null) streamedIndexes.add(su.step_index);
+                continue;
+              }
+              maybeCloseStream();
               progress(`step${idx}: ${label}…`);
             } else if (state === "ERROR" || state === "FAILED") {
+              maybeCloseStream();
               progress(`step${idx} error: ${label}`);
             }
           } else if (ev.event === "result") {
+            maybeCloseStream();
             progress("result received — finalizing…");
           }
         }
@@ -977,6 +1272,7 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 
 
     child.on("error", (err) => {
       if (heartbeat) clearInterval(heartbeat);
+      if (logStream) logStream.end();
       resolvePromise({
         code: 127,
         stdout,
@@ -988,6 +1284,7 @@ function runAgyOnce({ agyPath, cliArgs, cwd, env, streamProgress, heartbeatMs = 
 
     child.on("close", (code) => {
       if (heartbeat) clearInterval(heartbeat);
+      if (logStream) logStream.end();
       resolvePromise({
         code,
         stdout,
@@ -1333,11 +1630,22 @@ const outputFormat = resolveOutputFormat(
 const progressEnabled =
   resolveStreamProgress(cfg, args.streamProgress, args.streamProgressExplicit) &&
   outputFormat === "stream-json";
+const streamDetail = resolveStreamProgressDetail(
+  cfg,
+  args.streamProgressDetail,
+  args.streamProgressDetailExplicit
+);
 const heartbeatMs = 120000;
 const jsonSchemaPath = resolveJsonSchemaPath(
   cfg,
   args.jsonSchema,
   args.jsonSchemaExplicit
+);
+const stderrLog = resolveStderrLog(
+  cfg,
+  args.stderrLog,
+  args.stderrLogExplicit,
+  { cwd: args.cwd, phase: args.phase, change: args.change, project: args.project }
 );
 
 const skillName = phaseSkillName(args.phase);
@@ -1408,6 +1716,9 @@ function metaFor(resolvedPair, extraFields = {}) {
     artifact_store: args.artifactStore,
     output_format: outputFormat,
     json_schema_path: jsonSchemaPath,
+    stream_progress_detail: streamDetail,
+    stderr_log_path: stderrLog.path,
+    stderr_log_source: stderrLog.source,
     slash_command_skills: slashCfg,
     ...extraFields,
   };
@@ -1450,12 +1761,17 @@ process.stderr.write(
     resolved.effort ? `, effort ${resolved.effort}` : ""
   }, timeout ${timeout})\n`
 );
+if (stderrLog.path) {
+  process.stderr.write(`[agy] progress log: ${stderrLog.path}\n`);
+}
 let attempt = await runAgyOnce({
   agyPath,
   cliArgs,
   cwd: args.cwd,
   env,
   streamProgress: progressEnabled,
+  streamDetail: streamDetail.level,
+  stderrLogPath: stderrLog.path,
   heartbeatMs,
 });
 
@@ -1510,6 +1826,8 @@ if (
       cwd: args.cwd,
       env,
       streamProgress: progressEnabled,
+      streamDetail: streamDetail.level,
+      stderrLogPath: stderrLog.path,
       heartbeatMs,
     });
 

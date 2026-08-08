@@ -197,6 +197,8 @@ Runner defaults (overridable via CLI or `workers.agy`):
 | `--json-schema` / `json_schema` | `default` | Ships `schemas/sdd-phase-result.schema.json` |
 | `--no-json-schema` | — | Alias for `--json-schema none` |
 | `--stream-progress` | off | With stream-json: brief DONE lines on **stderr** |
+| `--stream-progress-detail` | `summary` | Progress verbosity: `summary` label only, `tools` + tool name/params, `full` + live model text + duration/tokens |
+| `--stderr-log` / `stderr_log` | off (`null`) | Write verbose progress to a file instead of stderr. Templates: `{config} {home} {cwd} {phase} {change} {project}`. Notice line + envelope `stderr_log_path` still expose the path |
 
 Parsing prefers `structured_output` object; else strips markdown fences from `response` and JSON-parses. Envelope includes `output_format`, `json_schema_path`, `structured_output_used`.
 
@@ -223,6 +225,22 @@ Health after install:
 ```bash
 node /path/to/Gentle-ai-mod/install.mjs --check
 ```
+
+## Verbose progress to file (v1.7)
+
+When `--stderr-log` (or `workers.agy.stderr_log`) is active, the runner writes ALL verbose progress to a file and leaves only a notice on stderr. The orchestrator's bash tool sees that notice — present it as a copy-paste ready command, never as a fake clickable link:
+
+```text
+Progreso de la fase: <path>
+Seguilo en vivo:  tail -f <path>
+```
+
+Rules:
+
+- Detect the line `[agy] progress log: <path>` in the runner's stderr; use that exact path (fall back to envelope `stderr_log_path` when the stderr line is missing).
+- Do **not** render a `file://` chip or claim it opens anything: OpenCode TUI has no click-to-open yet (#37891 open, PR #39206 in progress).
+- Keep it to the two-line block above; do not dump log contents into chat unless the user asks.
+- When `stderr_log` is off, skip this entirely — stderr progress already stays small.
 
 ## Invariants
 

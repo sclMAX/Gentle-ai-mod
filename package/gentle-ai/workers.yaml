@@ -26,6 +26,21 @@
 #   heartbeat to stderr; --no-stream-progress on the runner disables ticks.
 # - Stdout envelope contract unchanged: final JSON is parsed from the result event.
 #
+# v1.7 note (2026-08-07): --stderr-log file sink for verbose progress.
+# - workers.agy.stderr_log: null (off) | path template.
+#   Templates: {config} {home} {cwd} {phase} {change} {project}.
+# - When set, ALL [agy] progress lines (ticks, tools, text_delta, heartbeat)
+#   are appended to that file instead of stderr; one notice line
+#   "[agy] progress log: <path>" still goes to stderr, and the envelope meta
+#   includes stderr_log_path. CLI --stderr-log overrides the config.
+# - Off by default: stderr progress behaves exactly as v1.6.
+#
+# v1.6 note (2026-08-07): stream_progress_detail levels.
+# - summary (default): friendly label only.
+# - tools: + tool name and key parameters (run_command -> CommandLine, etc.).
+# - full: tools + live model text_delta streaming + duration/tokens on step close.
+# - CLI --stream-progress-detail overrides. Envelope meta includes the level.
+#
 # v1.4 note (2026-07-31): native /sdd-<phase> skill expansion in print mode.
 # - slash_command_skills: auto|on|off (CLI --slash-command-skills overrides)
 # - auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands on >= 1.1.9)
@@ -44,6 +59,15 @@ workers:
     json_schema: default
     # stderr progress ticks + heartbeat (runner --no-stream-progress to disable)
     stream_progress: true
+    # Verbosity of stderr progress: summary | tools | full
+    # summary: friendly label only | tools: + tool name/params | full: + live text_delta + tokens
+    # (CLI --stream-progress-detail overrides)
+    stream_progress_detail: full
+    # Verbose progress sink: null (off) | path template.
+    # When set, [agy] progress lines go to the file instead of stderr
+    # (notice line + envelope meta still expose the path).
+    # (CLI --stderr-log overrides)
+    stderr_log: null
     # auto|on|off — native /sdd-<phase> skill expansion in print mode.
     # auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands).
     slash_command_skills: auto
