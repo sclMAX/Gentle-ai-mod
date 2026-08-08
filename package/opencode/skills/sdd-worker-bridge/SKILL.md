@@ -228,19 +228,24 @@ node /path/to/Gentle-ai-mod/install.mjs --check
 
 ## Verbose progress to file (v1.7)
 
-When `--stderr-log` (or `workers.agy.stderr_log`) is active, the runner writes ALL verbose progress to a file and leaves only a notice on stderr. The orchestrator's bash tool sees that notice — present it as a copy-paste ready command, never as a fake clickable link:
+When `--stderr-log` (or `workers.agy.stderr_log`) is active, the runner writes ALL verbose progress to a file and leaves only a notice on stderr. The orchestrator must present the copy-paste ready command **BEFORE** launching the phase — after the run it is too late (the bash tool only sees the notice once the command has finished):
 
 ```text
 Progreso de la fase: <path>
 Seguilo en vivo:  tail -f <path>
 ```
 
+Pre-launch resolution (single source of truth = runner dry-run, never re-derive from config):
+
+1. Run once with `--dry-run` (plus the same `--stderr-log` / model / effort flags you will use) and read `stderr_log_path` from its JSON envelope. Dry-run spawns no agy process and costs milliseconds.
+2. If `stderr_log_path` is non-null, print the two-line block above, then launch the real phase (without `--dry-run`).
+3. If it is `null` (stderr_log off), skip the block — stderr progress already stays small.
+
 Rules:
 
-- Detect the line `[agy] progress log: <path>` in the runner's stderr; use that exact path (fall back to envelope `stderr_log_path` when the stderr line is missing).
 - Do **not** render a `file://` chip or claim it opens anything: OpenCode TUI has no click-to-open yet (#37891 open, PR #39206 in progress).
 - Keep it to the two-line block above; do not dump log contents into chat unless the user asks.
-- When `stderr_log` is off, skip this entirely — stderr progress already stays small.
+- The in-run stderr notice `[agy] progress log: <path>` still exists for manual runs, but the orchestrator must not wait for it to present the path.
 
 ## Invariants
 
