@@ -2,14 +2,6 @@
 /**
  * run-agy-phase — cross-platform SDD phase launcher for Antigravity CLI (agy)
  *
- * v1.7:
- *   - --stderr-log <path>; workers.agy.stderr_log config (templates {config}
- *     {home} {cwd} {phase} {change} {project}) redirects the verbose progress
- *     stream (ticks + text_delta) to a file instead of stderr, so the
- *     orchestrator's bash tool result stays small. A single notice line
- *     "[agy] progress log: <path>" still goes to stderr; the envelope meta
- *     includes stderr_log_path for the orchestrator to surface a link.
- *
  * v1.6:
  *   - --stream-progress-detail summary|tools|full; workers.agy.stream_progress_detail
  *     config (default summary)
@@ -57,9 +49,7 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   accessSync,
   constants,
-  createWriteStream,
   existsSync,
-  mkdirSync,
   readFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -132,8 +122,6 @@ Options:
                            summary = friendly label only
                            tools   = + tool name and key parameters
                            full    = tools + live model text_delta + duration/tokens
-  --stderr-log <path>      write verbose progress to this file instead of stderr
-                           (templates: {config} {home} {cwd} {phase} {change} {project})
   --dry-run                print resolved CLI args and exit 0
   --json                   kept for compatibility (always JSON envelope)
   -h, --help               show help
@@ -165,8 +153,6 @@ function parseArgs(argv) {
     streamProgressExplicit: false,
     streamProgressDetail: null, // null = use config default then summary
     streamProgressDetailExplicit: false,
-    stderrLog: null, // null = use config default then disabled
-    stderrLogExplicit: false,
     outputFormatExplicit: false,
     jsonSchemaExplicit: false,
   };
@@ -241,12 +227,6 @@ function parseArgs(argv) {
         const v = next();
         out.streamProgressDetail = v;
         out.streamProgressDetailExplicit = true;
-        break;
-      }
-      case "--stderr-log": {
-        const v = next();
-        out.stderrLog = v;
-        out.stderrLogExplicit = true;
         break;
       }
       case "--dry-run":
@@ -613,37 +593,6 @@ function resolveStreamProgress(cfg, cliValue, explicit) {
   const fromCfg = cfg.workers?.agy?.stream_progress;
   if (fromCfg != null && fromCfg !== "") return !!fromCfg;
   return true;
-}
-
-/**
- * Resolve stderr-log target path or null (disabled).
- * Config: workers.agy.stderr_log (may use templates).
- * CLI: --stderr-log overrides.
- * Templates: {config} {home} {cwd} {phase} {change} {project}
- */
-function resolveStderrLog(cfg, cliValue, explicit, vars) {
-  let spec = null;
-  let source = "default";
-  if (explicit) {
-    spec = cliValue != null && cliValue !== "" ? String(cliValue) : null;
-    source = "cli";
-  } else if (cfg.workers?.agy?.stderr_log != null) {
-    spec = String(cfg.workers.agy.stderr_log);
-    source = "config";
-  }
-  if (!spec || spec === "off" || spec === "none" || spec === "false") {
-    return { path: null, source };
-  }
-  const expanded = String(spec)
-    .replaceAll("{config}", join(homedir(), ".config", "gentle-ai"))
-    .replaceAll("{home}", homedir())
-    .replaceAll("{cwd}", vars.cwd)
-    .replaceAll("{phase}", vars.phase)
-    .replaceAll("{change}", vars.change)
-    .replaceAll("{project}", vars.project)
-    .replace(/^~(?=$|\/|\\)/, homedir());
-  const abs = resolve(expanded);
-  return { path: abs, source };
 }
 
 /**
@@ -1109,7 +1058,6 @@ function runAgyOnce({
   env,
   streamProgress,
   streamDetail,
-  stderrLogPath: logPath,
   heartbeatMs = 0,
 }) {
   return new Promise((resolvePromise) => {
@@ -1132,28 +1080,13 @@ function runAgyOnce({
     let streamOpen = false;
     const streamedIndexes = new Set();
 
-    // Optional verbose progress sink: file (append) instead of stderr so the
-    // orchestrator's bash tool result stays small. Error handling is passive:
-    // if the file cannot be opened we fall back to stderr.
-    let logStream = null;
-    try {
-      if (logPath) {
-        mkdirSync(dirname(logPath), { recursive: true });
-        logStream = createWriteStream(logPath, { flags: "a" });
-      }
-    } catch {
-      logStream = null;
-    }
-
     const fmtElapsed = (ms) => {
       const total = Math.floor(ms / 1000);
       const m = Math.floor(total / 60);
       return m > 0 ? `${m}m ${total % 60}s` : `${total}s`;
     };
     const emitLine = (line) => {
-      const text = `[agy] ${line}\n`;
-      if (logStream) logStream.write(text);
-      else process.stderr.write(text);
+      process.stderr.write(`[agy] ${line}\n`);
     };
     const progress = (line) => {
       if (streamOpen) {
@@ -1166,8 +1099,7 @@ function runAgyOnce({
     const progressStream = (text) => {
       const s = String(text || "");
       if (!s) return;
-      if (logStream) logStream.write(s);
-      else process.stderr.write(s);
+      process.stderr.write(s);
       streamOpen = !s.endsWith("\n");
       lastProgressAt = Date.now();
     };
@@ -1272,7 +1204,6 @@ function runAgyOnce({
 
     child.on("error", (err) => {
       if (heartbeat) clearInterval(heartbeat);
-      if (logStream) logStream.end();
       resolvePromise({
         code: 127,
         stdout,
@@ -1284,7 +1215,6 @@ function runAgyOnce({
 
     child.on("close", (code) => {
       if (heartbeat) clearInterval(heartbeat);
-      if (logStream) logStream.end();
       resolvePromise({
         code,
         stdout,
@@ -1641,12 +1571,6 @@ const jsonSchemaPath = resolveJsonSchemaPath(
   args.jsonSchema,
   args.jsonSchemaExplicit
 );
-const stderrLog = resolveStderrLog(
-  cfg,
-  args.stderrLog,
-  args.stderrLogExplicit,
-  { cwd: args.cwd, phase: args.phase, change: args.change, project: args.project }
-);
 
 const skillName = phaseSkillName(args.phase);
 const mainSkill = discoverSkill(cfg, args.cwd, skillName);
@@ -1717,8 +1641,6 @@ function metaFor(resolvedPair, extraFields = {}) {
     output_format: outputFormat,
     json_schema_path: jsonSchemaPath,
     stream_progress_detail: streamDetail,
-    stderr_log_path: stderrLog.path,
-    stderr_log_source: stderrLog.source,
     slash_command_skills: slashCfg,
     ...extraFields,
   };
@@ -1761,9 +1683,6 @@ process.stderr.write(
     resolved.effort ? `, effort ${resolved.effort}` : ""
   }, timeout ${timeout})\n`
 );
-if (stderrLog.path) {
-  process.stderr.write(`[agy] progress log: ${stderrLog.path}\n`);
-}
 let attempt = await runAgyOnce({
   agyPath,
   cliArgs,
@@ -1771,7 +1690,6 @@ let attempt = await runAgyOnce({
   env,
   streamProgress: progressEnabled,
   streamDetail: streamDetail.level,
-  stderrLogPath: stderrLog.path,
   heartbeatMs,
 });
 
@@ -1827,7 +1745,6 @@ if (
       env,
       streamProgress: progressEnabled,
       streamDetail: streamDetail.level,
-      stderrLogPath: stderrLog.path,
       heartbeatMs,
     });
 

@@ -109,7 +109,7 @@ node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
   --effort medium
 ```
 
-Runner v1.7 flags (defaults from `workers.yaml` when omitted):
+Runner v1.6 flags (defaults from `workers.yaml` when omitted):
 
 ```text
 --output-format json|stream-json   # default stream-json
@@ -122,8 +122,6 @@ Runner v1.7 flags (defaults from `workers.yaml` when omitted):
                                    # stderr progress verbosity (default: config, then summary)
                                    # summary = label only | tools = + tool name/params
                                    # full = tools + live model text + duration/tokens on close
---stderr-log <path>                # write verbose progress to file instead of stderr
-                                   # (templates: {config} {home} {cwd} {phase} {change} {project})
 --dry-run                          # print final CLI args (includes format + schema path)
 ```
 
@@ -155,12 +153,6 @@ cd Gentle-ai-mod && git pull && node install.mjs
 ---
 
 ## Changelog
-
-### v1.7
-
-- **Runner:** `--stderr-log <path>` — writes ALL verbose progress (ticks, tools, live `text_delta`, heartbeat) to a file instead of stderr, so the orchestrator's bash-tool result stays small; one notice line `[agy] progress log: <path>` still goes to stderr and the envelope meta gains `stderr_log_path`
-- **Config:** `workers.agy.stderr_log` (default `null`/off) supports templates `{config} {home} {cwd} {phase} {change} {project}`; CLI `--stderr-log` overrides it
-- **README:** flags block + changelog updated to match
 
 ### v1.6
 
