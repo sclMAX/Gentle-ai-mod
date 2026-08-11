@@ -4,7 +4,7 @@ description: "SDD worker bridge for agy vs OpenCode phase runners. Trigger: SDD 
 license: MIT
 metadata:
   author: gentle-ai-local
-  version: "1.2"
+  version: "1.3"
 ---
 
 # SDD Worker Bridge (Orchestrator only)
@@ -38,7 +38,7 @@ After SDD Session Preflight (includes **Workers** group):
 
 1. Read `~/.config/gentle-ai/workers.yaml` (and project override if present).
 2. Discover `agy`: `agy` on PATH (or `command` from config).
-3. If agy available: cache `agy models` list once.
+3. If agy available: cache `agy models` once. Try `agy models --output-format json` first (structured); on error fall back to plain `agy models` (tab-separated `id<TAB>Label`). Some 1.1.12 builds predate the `models --output-format` flag despite the changelog. Store parsed model ids in `session.agy_models`.
 4. Init session state:
 
 ```text

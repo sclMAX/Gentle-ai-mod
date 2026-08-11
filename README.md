@@ -154,6 +154,10 @@ cd Gentle-ai-mod && git pull && node install.mjs
 
 ## Changelog
 
+### v1.7
+
+- **Skill (worker bridge):** `agy models` cache probes `agy models --output-format json` first and falls back to the plain tab-separated list when the flag errors (some 1.1.12 builds predate the models/agents JSON flag — changelog is ahead of the shipped binary). Structured parsing activates automatically once the flag ships.
+
 ### v1.6
 
 - **Runner:** `--stream-progress-detail summary|tools|full` — stderr progress verbosity. `tools` shows tool name + key parameters (`running command: ls -la`); `full` adds live streaming of the model's `text_delta` and duration/tokens when each step closes

@@ -6,7 +6,7 @@ Orchestrator decision procedure. Run before every SDD phase.
 
 - [ ] Preflight complete including `worker_policy`
 - [ ] Load `~/.config/gentle-ai/workers.yaml` + optional `.atl/sdd-workers.yaml`
-- [ ] `agy.available` via PATH; cache `agy models` if available
+- [ ] `agy.available` via PATH; cache `agy models` once (probe `--output-format json`, fall back to plain tab-separated list)
 - [ ] Init exhausted flags false; empty phase_bindings
 
 ## B. Pre-launch
