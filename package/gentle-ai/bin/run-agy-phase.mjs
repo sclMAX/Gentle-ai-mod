@@ -974,6 +974,7 @@ function toolParamFromStep(su) {
   };
 
   const compact = (v) => {
+    if (v === null || v === undefined) return null;
     const s = typeof v === "string" ? v : JSON.stringify(v);
     if (!s) return null;
     const one = s.replace(/\s+/g, " ").trim();
