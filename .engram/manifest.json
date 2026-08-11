@@ -56,6 +56,14 @@
       "sessions": 3,
       "memories": 8,
       "prompts": 18
+    },
+    {
+      "id": "db22434d",
+      "created_by": "max",
+      "created_at": "2026-08-11T09:30:36Z",
+      "sessions": 5,
+      "memories": 8,
+      "prompts": 12
     }
   ]
 }
