@@ -57,8 +57,9 @@ workers:
     # auto|on|off — native /sdd-<phase> skill expansion in print mode.
     # auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands).
     slash_command_skills: auto
-    # Phase 2: herdr transport enabled by default (smoke-tested 2026-08-15).
-    # Rollback: set transport back to `direct` (no code change needed).
+    # v2.0 (2026-08-15): herdr is the ONLY transport. The legacy `direct`
+    # transport was removed from run-agy-phase.mjs — without herdr there is no
+    # way to watch what agy is doing. --transport / this key are ignored.
     transport: herdr
     herdr:
       tab_label: "sdd-{phase}-{change}"
