@@ -229,6 +229,16 @@ function getAgentInfo() {
   }
 }
 
+function getAgentRecentText() {
+  const res = spawnSync("herdr", [
+    "agent", "read", agentTarget,
+    "--source", "recent",
+    "--lines", "40",
+    "--format", "text"
+  ], { encoding: "utf8" });
+  return res.status === 0 ? `${res.stdout || ""}\n${res.stderr || ""}` : "";
+}
+
 function completeWithResult(parsed) {
   if (finished) return;
   finished = true;
@@ -295,14 +305,17 @@ function launchPrompt() {
     child = null;
     if (finished) return;
 
-    // Check account verification notice first
-    if (VERIFY_PATTERN.test(promptOutput)) {
+    // A stalled prompt may not include the pane's account-verification notice.
+    // Read the pane only for this inconclusive handshake, not on every poll.
+    const needsPaneRead = /agent_prompt_stalled/i.test(promptOutput) && !VERIFY_PATTERN.test(promptOutput);
+    const paneOutput = needsPaneRead ? getAgentRecentText() : "";
+    if (VERIFY_PATTERN.test(`${promptOutput}\n${paneOutput}`)) {
       verifyMode = true;
       if (promptAttempt < MAX_VERIFY_ATTEMPTS) {
         setTimeout(launchPrompt, VERIFY_RETRY_MS);
         return;
       }
-      die(4, "Account verification pending: " + (promptOutput.trim().split("\n")[0] || "agy is verifying the account"), {
+      die(4, "Account verification pending: agy is verifying the account", {
         error_class: "unavailable",
         stall_reason: "account_verification",
         attempts: promptAttempt

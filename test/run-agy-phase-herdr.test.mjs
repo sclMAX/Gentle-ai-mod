@@ -75,6 +75,53 @@ exit 1
   assert.doesNotMatch(out, /contract/);
 });
 
+test("stalled prompt reads the pane for account verification before startup timeout", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-pane-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then echo '{"result":{"tab":{"tab_id":"t-pane"},"root_pane":{"pane_id":"p-pane"}}}'; exit 0; fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"idle"}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then echo "agent_prompt_stalled" >&2; exit 1; fi
+  if [ "$2" = "read" ]; then
+    echo "Verifying your account..."
+    echo "We're finishing verifying your account eligibility."
+    echo "This usually takes a moment. Please try again shortly."
+    exit 0
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    GGA_HERDR_VERIFY_RETRY_MS: "1",
+    GGA_HERDR_MAX_VERIFY_ATTEMPTS: "1",
+    GGA_HERDR_STARTUP_TIMEOUT_MS: "80",
+    GGA_HERDR_POLL_INTERVAL_MS: "20",
+  };
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "test", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 4);
+  assert.strictEqual((capture.match(/CALL:agent prompt/g) || []).length, 1);
+  assert.strictEqual((capture.match(/CALL:agent read/g) || []).length, 1);
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.error_class, "unavailable");
+  assert.strictEqual(out.stall_reason, "account_verification");
+  assert.doesNotMatch(result.stdout.toString(), /We're finishing|Try again shortly/i);
+});
+
 test("model/effort/timeout are forwarded to agy agent start and prompt", () => {
   // Fake `herdr` that records every invocation and completes a prompt by
   // writing the sentinel file it extracts from the prompt text.
