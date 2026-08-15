@@ -57,6 +57,17 @@ workers:
     # auto|on|off — native /sdd-<phase> skill expansion in print mode.
     # auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands).
     slash_command_skills: auto
+    transport: direct
+    herdr:
+      tab_label: "sdd-{phase}-{change}"
+      stalled_gate:
+        tier1_startup_ms: 10000
+        tier2_rolling_ms: 120000
+        poll_interval_ms: 10000
+      blocked_policy: notify
+      blocked_timeout_ms: 300000
+      allowlist:
+        - "Proceed?"
     extra_args:
       # Runner merges --output-format / --json-schema; keep permissions here
       - "--dangerously-skip-permissions"

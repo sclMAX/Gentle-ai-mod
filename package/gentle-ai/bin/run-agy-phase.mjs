@@ -143,6 +143,7 @@ function parseArgs(argv) {
     promptFile: null,
     prompt: null,
     config: null,
+    transport: null,
     dryRun: false,
     json: true,
     outputFormat: null, // null = use config default then json
@@ -192,6 +193,9 @@ function parseArgs(argv) {
         break;
       case "--config":
         out.config = resolve(next());
+        break;
+      case "--transport":
+        out.transport = next();
         break;
       case "--output-format": {
         const v = next();
@@ -1531,6 +1535,20 @@ if (!args.project) die(2, "Missing --project");
 if (!existsSync(args.cwd)) die(2, `cwd does not exist: ${args.cwd}`);
 
 const cfg = loadConfig(args.config, args.cwd);
+
+const transport = args.transport || cfg.workers?.agy?.transport || "herdr";
+if (transport === "herdr") {
+  const herdrRunner = join(__dirname, "run-agy-phase-herdr.mjs");
+  const res = spawnSync(process.execPath, [herdrRunner, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if (res.error && res.error.code === 'ENOENT') {
+    die(6, "run-agy-phase-herdr.mjs not found next to runner.", { error_class: "herdr_missing" });
+  }
+  process.exit(res.status ?? 1);
+}
+
 if (cfg.workers?.agy?.enabled === false) {
   die(3, "agy worker disabled in workers.yaml", { error_class: "unavailable" });
 }

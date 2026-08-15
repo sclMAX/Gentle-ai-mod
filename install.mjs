@@ -158,6 +158,10 @@ function installGentleAi() {
     join(destRoot, "bin", "run-agy-phase.mjs")
   );
   copyFile(
+    join(PKG, "gentle-ai", "bin", "run-agy-phase-herdr.mjs"),
+    join(destRoot, "bin", "run-agy-phase-herdr.mjs")
+  );
+  copyFile(
     join(PKG, "gentle-ai", "bin", "patch-orchestrator-worker-bridge.mjs"),
     join(destRoot, "bin", "patch-orchestrator-worker-bridge.mjs")
   );
@@ -197,6 +201,7 @@ Restart OpenCode after install/patch.
   }
 
   chmodX(join(destRoot, "bin", "run-agy-phase.mjs"));
+  chmodX(join(destRoot, "bin", "run-agy-phase-herdr.mjs"));
   chmodX(join(destRoot, "bin", "patch-orchestrator-worker-bridge.mjs"));
 }
 

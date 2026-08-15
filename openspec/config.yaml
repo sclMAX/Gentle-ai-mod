@@ -1,0 +1,25 @@
+project: gentle-ai-mod
+version: "1.0"
+artifact_store: hybrid
+strict_tdd: false
+stack:
+  primary: Node.js (v25.9.0)
+  languages:
+    - JavaScript (ESM / Node.js)
+    - Shell (Bash / PowerShell)
+  components:
+    - Gentle AI CLI
+    - OpenCode Agent Integration
+    - agy Antigravity Worker Bridge
+testing:
+  runner: node
+  commands:
+    health_check: "node install.mjs --check"
+    syntax_check: "node --check install.mjs package/gentle-ai/bin/*.mjs"
+    smoke_check: "node package/gentle-ai/bin/run-agy-phase.mjs --dry-run --phase explore --change test --project gentle-ai-mod"
+  strict_tdd: false
+  reason: "No formal unit test runner (vitest/jest/go test) configured; health/syntax smoke checks available."
+skill_registry:
+  path: ".atl/skill-registry.md"
+  synced_skills:
+    - sdd-worker-bridge
