@@ -36,6 +36,7 @@ if (!dryRun) {
 }
 
 let phase, change, project, cwd = process.cwd(), promptText = "", promptFile = "";
+let model = null, effort = null, timeoutArg = null;
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -46,6 +47,34 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--cwd") cwd = next();
   else if (a === "--prompt") promptText = next();
   else if (a === "--prompt-file") promptFile = next();
+  else if (a === "--model") model = next();
+  else if (a === "--effort") effort = next();
+  else if (a === "--timeout") timeoutArg = next();
+}
+
+/**
+ * Parse a duration like "20m", "90s", "1h" or raw milliseconds into ms.
+ * Returns null when the value is missing or unparseable.
+ */
+function parseTimeoutMs(value) {
+  if (!value) return null;
+  const s = String(value).trim();
+  const m = s.match(/^(\d+)\s*(ms|s|m|h)?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = (m[2] || "ms").toLowerCase();
+  const mult = { ms: 1, s: 1000, m: 60000, h: 3600000 }[unit];
+  return n * mult;
+}
+
+/** Models that reject --effort entirely (mirror of run-agy-phase.mjs). */
+function modelSupportsEffortFlag(modelId) {
+  if (!modelId) return true;
+  const id = String(modelId).toLowerCase();
+  if (id.includes("claude")) return false;
+  if (id.includes("opus") && id.includes("thinking")) return false;
+  if (id.startsWith("gpt-oss")) return false;
+  return true;
 }
 
 if (!phase || !change || !project) {
@@ -72,8 +101,19 @@ if (promptFile && existsSync(promptFile)) {
 
 if (dryRun) {
   console.log(`Dry run executing with transport herdr. prompt length: ${promptText.length}`);
+  console.log(`Model: ${model || "(default)"}  Effort: ${effort || "(none)"}  Timeout: ${timeoutArg || "(default 10m)"}`);
+  console.log(`Agent start args: ${JSON.stringify(agentStartArgsForDryRun())}`);
   console.log(`Prompt used: ${promptText}`);
   process.exit(0);
+}
+
+function agentStartArgsForDryRun() {
+  const args = ["agent", "start", `sdd-agent-<ts>`, "--kind", "agy", "--pane", "<pane>"];
+  const cli = [];
+  if (model) cli.push("--model", String(model));
+  if (effort && modelSupportsEffortFlag(model)) cli.push("--effort", String(effort));
+  if (cli.length) args.push("--", ...cli);
+  return args;
 }
 
 let activeCwd = cwd;
@@ -106,7 +146,15 @@ if (!tabId || !paneId) {
 }
 
 const agentName = `sdd-agent-${Date.now()}`;
-const agentRes = spawnSync("herdr", ["agent", "start", agentName, "--kind", "agy", "--pane", paneId], { encoding: "utf8" });
+const agentStartArgs = ["agent", "start", agentName, "--kind", "agy", "--pane", paneId];
+// Pass model/effort through to the agy CLI via the trailing `--` agent args.
+// Without this, agy starts with its own default model (e.g. Gemini 3.7 Flash
+// medium) no matter what --model the orchestrator requested.
+const agentCliArgs = [];
+if (model) agentCliArgs.push("--model", String(model));
+if (effort && modelSupportsEffortFlag(model)) agentCliArgs.push("--effort", String(effort));
+if (agentCliArgs.length) agentStartArgs.push("--", ...agentCliArgs);
+const agentRes = spawnSync("herdr", agentStartArgs, { encoding: "utf8" });
 if (agentRes.status !== 0) {
   die(4, "Failed to start agent: " + agentRes.stderr);
 }
@@ -122,7 +170,8 @@ try {
 const sentinelFile = join(tmpdir(), `agy_result_${Date.now()}.json`);
 const promptWithSentinel = `${promptText}\n\nIMPORTANT: when finished, write your structured result JSON to exactly this path (overwrite the file, absolute path):\n${sentinelFile}\n`;
 
-const promptArgs = ["agent", "prompt", agentTarget, promptWithSentinel, "--wait", "--timeout", String(10 * 60 * 1000)];
+const promptTimeoutMs = parseTimeoutMs(timeoutArg) || 10 * 60 * 1000;
+const promptArgs = ["agent", "prompt", agentTarget, promptWithSentinel, "--wait", "--timeout", String(promptTimeoutMs)];
 let child = null;
 
 // herdr's --wait requires an observed state change within 5s of submission.
@@ -171,6 +220,7 @@ function launchPrompt() {
       return;
     }
     if (verifyMode && promptAttempt >= maxAttempts) {
+      cleanupAgent();
       die(4, "Account verification pending: " + (promptOutput.trim().split("\n")[0] || "agy is verifying the account"), { error_class: "unavailable", stall_reason: "account_verification", attempts: promptAttempt });
       return;
     }
@@ -180,10 +230,27 @@ function launchPrompt() {
 
 launchPrompt();
 
+let lastSeq = null;
 let lastRevision = null;
 let noActivityTime = 0;
 let tier1Passed = false;
 let blocked = false;
+
+// Startup: agy may take a while to become ready (model spin-up, account check).
+// Inactivity: never kill before the prompt's own --timeout gets a chance —
+// the prompt is the authority; the poll is only a backstop. If the agent is
+// genuinely working (state_change_seq advancing or status == "working") we
+// never treat it as inactive, even when `revision` stays flat.
+const STARTUP_TIMEOUT_MS = 60000;
+const INACTIVITY_TIMEOUT_MS = Math.max(promptTimeoutMs, 120000);
+
+// Best-effort cleanup so a timed-out run does not leave the agy agent alive
+// in the tab working on the same files (duplicate work / zombie agent).
+function cleanupAgent() {
+  try {
+    if (tabId) spawnSync("herdr", ["tab", "close", tabId], { encoding: "utf8" });
+  } catch (e) {}
+}
 
 const pollInterval = setInterval(() => {
   const statusRes = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
@@ -191,33 +258,42 @@ const pollInterval = setInterval(() => {
     try {
       const data = JSON.parse(statusRes.stdout);
       const agent = data.result?.agent || data.agent || {};
+      const seq = agent.state_change_seq;
       const rev = agent.revision;
-      if (rev !== lastRevision) {
-        lastRevision = rev;
+      const status = agent.agent_status;
+      // Real activity: any state-change sequence advance, revision change, or
+      // the agent actively working. agy keeps state_change_seq advancing while
+      // it works even when `revision` stays flat.
+      const active = status === "working" || seq !== lastSeq || rev !== lastRevision;
+      if (seq !== lastSeq) lastSeq = seq;
+      if (rev !== lastRevision) lastRevision = rev;
+      if (active) {
         noActivityTime = 0;
         tier1Passed = true;
       } else {
         noActivityTime += 10000;
-        // While agy is verifying the account, the agent revision may not
-        // advance for a while. Do not kill on the fast startup timeout in
-        // verifyMode — the verification retry loop owns the outcome.
-        if (!tier1Passed && noActivityTime >= 10000 && !verifyMode) {
+        if (!tier1Passed && noActivityTime >= STARTUP_TIMEOUT_MS && !verifyMode) {
           clearInterval(pollInterval);
-          child.kill();
+          if (child) child.kill();
+          cleanupAgent();
           die(8, "Startup timeout", { error_class: "stalled", stall_reason: "startup_timeout" });
         }
-        if (tier1Passed && noActivityTime >= 120000) {
+        if (tier1Passed && noActivityTime >= INACTIVITY_TIMEOUT_MS && !verifyMode) {
           clearInterval(pollInterval);
-          child.kill();
+          if (child) child.kill();
+          cleanupAgent();
           die(8, "Inactivity timeout", { error_class: "stalled", stall_reason: "inactivity_timeout" });
         }
       }
-      
+
       if (agent.agent_status === "blocked" && !blocked) {
         blocked = true;
         const envelope = { status: "blocked", error_class: "permission_required", message: "Agent blocked." };
         process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
         setTimeout(() => {
+          clearInterval(pollInterval);
+          if (child) child.kill();
+          cleanupAgent();
           die(7, "Blocked timeout", { error_class: "blocked_timeout" });
         }, 300000);
       }
@@ -245,6 +321,7 @@ function onPromptClose(code) {
   }
 
   if (!existsSync(sentinelFile)) {
+    cleanupAgent();
     die(5, "Contract violation: result file not found");
   }
   
@@ -253,6 +330,7 @@ function onPromptClose(code) {
   try {
     parsed = JSON.parse(resultData);
   } catch (e) {
+    cleanupAgent();
     die(5, "Contract violation: invalid JSON in result file");
   }
   
@@ -271,6 +349,9 @@ function onPromptClose(code) {
     project,
     cwd,
     transport: "herdr",
+    model: model || null,
+    effort: effort || null,
+    prompt_timeout_ms: promptTimeoutMs,
     conversation_id: conversationId,
     tab_id: tabId
   };
