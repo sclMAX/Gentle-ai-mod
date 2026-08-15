@@ -18,7 +18,8 @@ Before launching ANY sub-agent (SDD phase or delegated task: explore/general/wri
 
 **Portable files (never hardcode machine-specific paths in repo commits):**
 - Config: \`~/.config/gentle-ai/workers.yaml\` (optional override: \`<repo>/.atl/sdd-workers.yaml\`)
-- Runner: \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs\`
+- SDD runner: \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs\`
+- Delegated-task runner: \`node ~/.config/gentle-ai/bin/run-agy-task.mjs\`
 - Skill: opencode skills \`sdd-worker-bridge\`
 
 **Roles:** OpenCode \`gentle-orchestrator\` = only orchestrator. Workers: \`opencode\` (native \`task\` + subagent) or \`agy\` (Antigravity CLI via runner). Workers never route the pipeline.
@@ -43,17 +44,19 @@ session.agy_models (cached from \`agy models\` when available)
 2. If worker=agy and \`model_picker=on-agy-ask\` and no model set: list the REAL available models (from \`session.agy_models\` cache) and RECOMMEND model+effort for the task (see heuristic below). The recommended option is FIRST with "(Recomendado)". User accepts the recommendation or picks another from the catalog. STOP until answered.
 3. Freeze the binding per (phase | task-fingerprint); never re-ask the same launch.
 
-**Model recommendation heuristic (agy):**
-- Read / explore / map / research task → \`gemini-3.6-flash-medium\` (effort medium) — cheap and fast
-- Write / apply / implement task → \`gemini-3.1-pro-high\` (effort high) — strongest writer
-- Design / reason / verify task → \`claude-sonnet-4-6\` (no effort flag; runner strips it) — strong reasoning
-- Heavy / adversarial task → \`claude-opus-4-6-thinking\` (no effort flag) — strongest
-- Fallbacks when the recommended model is quota-blocked, in order: \`gemini-3.7-flash-high\` → \`gemini-3.6-flash-high\` → \`gemini-3.1-pro-high\` → \`gemini-3.6-flash-medium\`.
+**Model/effort resolution — radical data-driven mode (HARD GATE):**
+- The model heuristic is NOT stored in this prompt. The only source of truth is \`~/.config/gentle-ai/workers.yaml\`, merged with the optional repository override \`<repo>/.atl/sdd-workers.yaml\`.
+- During bootstrap, read the effective YAML before making any recommendation or launching an agy worker. Cache \`recommend_by_task\`, \`model_by_phase\`, \`model_fallback\`, and the applicable defaults in session state.
+- Never recommend or invent a model from prompt memory. If the effective YAML has not been read, STOP the launch and read it first.
+- Resolve in this order: explicit user override → frozen binding → \`model_by_phase[phase]\` → \`recommend_by_task[task_kind]\` → \`default_model\` → omit. Resolve effort with the same precedence using the corresponding effort fields.
+- Validate the selected model against the real \`session.agy_models\` catalog. If unavailable, use the exact \`model_fallback\` list from the effective YAML, in order, and report the fallback.
 
 **Run:**
 - opencode → \`task(subagent_type: <type>, prompt: ...)\` with skills injected
-- agy → write prompt file then:
-  \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase <p> --change <c> --project <proj> --cwd <git_root> --artifact-store <mode> --prompt-file <file> [--model] [--effort]\` (SDD) or the runner equivalent for the delegated task (non-SDD)
+- agy → write a prompt file and use the phase runner only for SDD phases:
+  \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase <p> --change <c> --project <proj> --cwd <git_root> --artifact-store <mode> --prompt-file <file> [--model] [--effort]\`
+- For non-SDD delegated tasks, use the generic runner (never invent an SDD phase):
+  \`node ~/.config/gentle-ai/bin/run-agy-task.mjs --task-kind <explore|general|writer> --project <proj> --cwd <git_root> --prompt-file <file> [--model] [--effort] [--timeout]\`
 
 **Gatekeeper:** Engram/OpenSpec artifact is authority; stdout envelope is a hint only.
 

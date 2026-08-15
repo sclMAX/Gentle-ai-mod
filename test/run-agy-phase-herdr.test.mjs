@@ -27,12 +27,11 @@ test("prompt-file security avoids shell interpolation", () => {
   const result = spawnSync(process.execPath, [
     runnerPath, "--dry-run", "--phase", "explore", "--change", "test", "--project", "p", "--cwd", process.cwd(), "--prompt", "$(id)"
   ], { env: { ...process.env, HERDR_SOCKET_PATH: "/tmp/fake.sock" } });
-  
+
   const out = result.stdout.toString();
   assert.match(out, /\$\(id\)/);
   assert.doesNotMatch(out, /uid=/);
 });
-
 test("cwd validation and path.resolve() prevents escapes", () => {
   const result = spawnSync(process.execPath, [
     runnerPath, "--dry-run", "--phase", "explore", "--change", "test", "--project", "p", "--cwd", "../../"
@@ -160,4 +159,177 @@ exit 1
   assert.strictEqual(result.status, 0);
   assert.doesNotMatch(capture, /worktree/);
   assert.match(capture, /tab create .*--cwd/);
+});
+
+test("stalled prompt followed by eventual completion does not create a duplicate prompt or tab", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-stalled-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const stateFile = join(fakeDir, "state.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(stateFile, "0");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-stalled"},"root_pane":{"pane_id":"p-stalled"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then
+    COUNT=$(cat "$STATE")
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$STATE"
+    if [ "$COUNT" -eq 1 ]; then
+      echo '{"result":{"agent":{"agent_status":"idle","state_change_seq":1,"revision":1}}}'
+      exit 0
+    elif [ "$COUNT" -eq 2 ]; then
+      echo '{"result":{"agent":{"agent_status":"working","state_change_seq":2,"revision":1}}}'
+      exit 0
+    else
+      # Agent finished: write the sentinel file extracted from the prompt
+      SENTINEL=$(grep -oE '/[^ ]+agy_result_[0-9]+\\.json' "$CAPTURE" | head -1)
+      if [ -n "$SENTINEL" ]; then
+        echo '{"status":"success","executive_summary":"completed after stall","artifacts":["fix.js"],"next_recommended":"","risks":[],"worker":"agy","phase":"explore","project":"p","change_name":"c","error_class":null}' > "$SENTINEL"
+      fi
+      echo '{"result":{"agent":{"agent_status":"done","state_change_seq":3,"revision":2}}}'
+      exit 0
+    fi
+  fi
+  if [ "$2" = "prompt" ]; then
+    # Simulate 5-second wait handshake stall from herdr
+    echo "agent_prompt_stalled: no state change observed within 5000ms" >&2
+    exit 1
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    STATE: stateFile,
+    GGA_HERDR_POLL_INTERVAL_MS: "30",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 0, `Expected exit 0, got ${result.status}. stdout: ${result.stdout} stderr: ${result.stderr}`);
+
+  // Verify exactly 1 tab create and exactly 1 agent prompt (no duplicate tab or prompt)
+  const tabCreates = (capture.match(/CALL:tab create/g) || []).length;
+  const promptCalls = (capture.match(/CALL:agent prompt/g) || []).length;
+  const tabCloses = (capture.match(/CALL:tab close/g) || []).length;
+
+  assert.strictEqual(tabCreates, 1, `Expected exactly 1 tab create, got ${tabCreates}`);
+  assert.strictEqual(promptCalls, 1, `Expected exactly 1 agent prompt call, got ${promptCalls}`);
+  assert.strictEqual(tabCloses, 1, `Expected exactly 1 tab close call, got ${tabCloses}`);
+
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "success");
+  assert.strictEqual(out.executive_summary, "completed after stall");
+  assert.strictEqual(out.worker, "agy");
+  assert.strictEqual(out.transport, "herdr");
+});
+
+test("true terminal failure (agent crash) exits with useful structured error and cleans up tab", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-crash-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-crash"},"root_pane":{"pane_id":"p-crash"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"crashed"}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    echo "agent_prompt_stalled: agent crashed during prompt" >&2
+    exit 1
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    GGA_HERDR_POLL_INTERVAL_MS: "30",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 4);
+  const tabCloses = (capture.match(/CALL:tab close/g) || []).length;
+  assert.strictEqual(tabCloses, 1, `Expected tab close to be called for cleanup on crash`);
+
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "failed");
+  assert.strictEqual(out.error_class, "unavailable");
+  assert.match(out.message, /crashed|terminal dead state/);
+});
+
+test("startup timeout when agent stays idle and never starts exits with stalled error and cleans up tab", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-timeout-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-timeout"},"root_pane":{"pane_id":"p-timeout"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"idle","state_change_seq":1,"revision":1}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    echo "agent_prompt_stalled" >&2
+    exit 1
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    GGA_HERDR_POLL_INTERVAL_MS: "20",
+    GGA_HERDR_STARTUP_TIMEOUT_MS: "80",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 8);
+  const tabCloses = (capture.match(/CALL:tab close/g) || []).length;
+  assert.strictEqual(tabCloses, 1, `Expected tab close to be called for cleanup on timeout`);
+
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "failed");
+  assert.strictEqual(out.error_class, "stalled");
+  assert.strictEqual(out.stall_reason, "startup_timeout");
 });

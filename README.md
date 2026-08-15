@@ -89,15 +89,15 @@ Gentle-ai-mod/
 ## Worker bridge (behavior summary)
 
 - **Orchestrator:** only OpenCode `gentle-orchestrator`
-- **Eligible phases on agy:** explore, propose, spec, design, tasks, verify
-- **Always OpenCode:** apply, archive, init, review/git
+- **Eligible SDD phases on agy:** explore, propose, spec, design, tasks, apply, verify, archive, init, onboard
+- **Always OpenCode:** review lifecycle and commit/PR
 - **Policy (preflight):** ask-each-phase | prefer-agy | prefer-opencode | opencode-only | agy-only
 - **Failover:** contract retry → model fallback (agy) → other worker once
 - **Authority:** Engram/OpenSpec store wins over CLI stdout
 
 Config defaults live in `package/gentle-ai/workers.yaml`.
 
-Manual phase launch:
+Manual SDD phase launch:
 
 ```bash
 node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
@@ -107,6 +107,16 @@ node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
   --cwd /path/to/repo \
   --model gemini-3.6-flash-medium \
   --effort medium
+```
+
+Manual non-SDD delegated task launch (do not route it through an artificial phase):
+
+```bash
+node ~/.config/gentle-ai/bin/run-agy-task.mjs \
+  --task-kind general \
+  --project my-project \
+  --cwd /path/to/repo \
+  --prompt-file /tmp/task-prompt.txt
 ```
 
 Runner v1.6 flags (defaults from `workers.yaml` when omitted):

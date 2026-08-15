@@ -162,6 +162,10 @@ function installGentleAi() {
     join(destRoot, "bin", "run-agy-phase-herdr.mjs")
   );
   copyFile(
+    join(PKG, "gentle-ai", "bin", "run-agy-task.mjs"),
+    join(destRoot, "bin", "run-agy-task.mjs")
+  );
+  copyFile(
     join(PKG, "gentle-ai", "bin", "patch-orchestrator-worker-bridge.mjs"),
     join(destRoot, "bin", "patch-orchestrator-worker-bridge.mjs")
   );
@@ -179,6 +183,7 @@ function installGentleAi() {
 
 - workers.yaml — SDD worker bridge policy
 - bin/run-agy-phase.mjs — launch one SDD phase via agy (v1.2: json-schema default)
+- bin/run-agy-task.mjs — launch a non-SDD delegated task via agy
 - bin/patch-orchestrator-worker-bridge.mjs — re-apply orchestrator prompt patch
 - schemas/sdd-phase-result.schema.json — default phase result contract for --json-schema
 
@@ -202,6 +207,7 @@ Restart OpenCode after install/patch.
 
   chmodX(join(destRoot, "bin", "run-agy-phase.mjs"));
   chmodX(join(destRoot, "bin", "run-agy-phase-herdr.mjs"));
+  chmodX(join(destRoot, "bin", "run-agy-task.mjs"));
   chmodX(join(destRoot, "bin", "patch-orchestrator-worker-bridge.mjs"));
 }
 

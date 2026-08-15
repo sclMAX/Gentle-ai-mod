@@ -28,7 +28,8 @@ Same artifact contract. One orchestrator. Failover on quota.
 |------|----------|
 | User config | `~/.config/gentle-ai/workers.yaml` |
 | Project override | `<repo>/.atl/sdd-workers.yaml` |
-| Runner | `~/.config/gentle-ai/bin/run-agy-phase.mjs` |
+| SDD runner | `~/.config/gentle-ai/bin/run-agy-phase.mjs` |
+| Generic task runner | `~/.config/gentle-ai/bin/run-agy-task.mjs` |
 | This skill | `~/.config/opencode/skills/sdd-worker-bridge/SKILL.md` |
 | Full checklist | `references/phase-launch-checklist.md` |
 
@@ -101,12 +102,20 @@ same rules against task_bindings[task-fingerprint]
 
 ### Model / effort — universal selector (agy only)
 
+**Radical data-driven mode (HARD GATE):** model recommendations are not stored
+in this skill or in the orchestrator prompt. Before the first recommendation or
+agy launch in every session, read the effective
+`~/.config/gentle-ai/workers.yaml` plus the optional `<repo>/.atl/sdd-workers.yaml`
+override. Cache `recommend_by_task`, `model_by_phase`, `model_fallback`, and
+defaults in session state. Never use model values from prompt memory; if the
+configuration has not been read, stop and read it first.
+
 ```text
 model  = override ?? binding ?? model_by_phase[phase] ?? recommend_by_task[task_kind] ?? default_model ?? omit
 effort = override ?? binding ?? effort_by_phase[phase] ?? recommend_by_task[task_kind].effort ?? default_effort ?? omit
 ```
 
-Universal selector (v2): if `model_picker=on-agy-ask` and worker freshly chosen as agy and no model set and interactive — list the REAL available models from `session.agy_models` in the `question` tool, with the RECOMMENDED one first (label ends '(Recomendado)'). Recommendation source: `workers.agy.recommend_by_task[task_kind]` (read/write/design/heavy) falling back to `model_by_phase[phase]`. User accepts or picks another. STOP until answered. Never dump a fixed 3-profile list.
+Universal selector (v2): if `model_picker=on-agy-ask` and worker freshly chosen as agy and no model set and interactive — list the REAL available models from `session.agy_models` in the `question` tool, with the RECOMMENDED one first (label ends '(Recomendado)'). Recommendation source: the effective YAML's `workers.agy.recommend_by_task[task_kind]` (read/write/design/heavy) falling back to `model_by_phase[phase]`. Validate the recommendation against `session.agy_models`; if unavailable, walk the effective YAML's `model_fallback` list in order. User accepts or picks another. STOP until answered. Never dump a fixed 3-profile list.
 
 OpenCode models stay on `opencode.json` `agent.sdd-<phase>.model`.
 
@@ -130,6 +139,17 @@ node ~/.config/gentle-ai/bin/run-agy-phase.mjs \
   --prompt-file <path> \
   [--model ...] [--effort ...] [--timeout ...]
 ```
+
+For non-SDD delegated tasks (`explore`, `general`, `writer`), use the generic
+runner instead of fabricating an SDD phase:
+
+```text
+node ~/.config/gentle-ai/bin/run-agy-task.mjs \
+  --task-kind <explore|general|writer> --project <project> --cwd <git_root> \
+  --prompt-file <path> [--model ...] [--effort ...] [--timeout ...]
+```
+
+Review lifecycle gates and commit/PR work remain orchestrator-only.
 
 Write the full phase prompt to a temp file under the OS temp dir (or repo-safe temp), pass `--prompt-file`. Do not inline huge prompts on Windows command limits when avoidable.
 

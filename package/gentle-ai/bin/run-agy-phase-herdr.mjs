@@ -4,7 +4,29 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 
+let finished = false;
+let cleanedUp = false;
+let pollInterval = null;
+let child = null;
+let tabId = null;
+let paneId = null;
+
+function cleanupAgent() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  try {
+    if (tabId) spawnSync("herdr", ["tab", "close", tabId], { encoding: "utf8" });
+  } catch (e) {}
+}
+
 function die(code, msg, extra = {}) {
+  if (finished) return;
+  finished = true;
+  if (pollInterval) clearInterval(pollInterval);
+  if (child) {
+    try { child.kill(); } catch (e) {}
+  }
+  cleanupAgent();
   const envelope = {
     status: "failed",
     error_class: extra.error_class || "unavailable",
@@ -35,13 +57,15 @@ if (!dryRun) {
   }
 }
 
-let phase, change, project, cwd = process.cwd(), promptText = "", promptFile = "";
+let phase, taskKind, taskLabel, change, project, cwd = process.cwd(), promptText = "", promptFile = "";
 let model = null, effort = null, timeoutArg = null;
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   const next = () => argv[++i];
   if (a === "--phase") phase = next();
+  else if (a === "--task-kind") taskKind = next();
+  else if (a === "--task-label") taskLabel = next();
   else if (a === "--change") change = next();
   else if (a === "--project") project = next();
   else if (a === "--cwd") cwd = next();
@@ -77,8 +101,12 @@ function modelSupportsEffortFlag(modelId) {
   return true;
 }
 
-if (!phase || !change || !project) {
-  die(2, "Missing required arguments: --phase, --change, --project");
+const isTask = Boolean(taskKind);
+if (isTask && !["explore", "general", "writer"].includes(taskKind)) {
+  die(2, "Invalid --task-kind. Expected explore, general, or writer", { error_class: "invalid_arguments" });
+}
+if ((!isTask && (!phase || !change)) || !project) {
+  die(2, isTask ? "Missing required arguments: --task-kind, --project" : "Missing required arguments: --phase, --change, --project");
 }
 
 cwd = resolve(cwd);
@@ -99,8 +127,11 @@ if (promptFile && existsSync(promptFile)) {
   promptText = "Follow conventions.";
 }
 
+const effectiveLabel = taskLabel || `agy-task-${taskKind}`;
+
 if (dryRun) {
   console.log(`Dry run executing with transport herdr. prompt length: ${promptText.length}`);
+  if (isTask) console.log(`Task kind: ${taskKind}  Label: ${effectiveLabel}`);
   console.log(`Model: ${model || "(default)"}  Effort: ${effort || "(none)"}  Timeout: ${timeoutArg || "(default 10m)"}`);
   console.log(`Agent start args: ${JSON.stringify(agentStartArgsForDryRun())}`);
   console.log(`Prompt used: ${promptText}`);
@@ -108,7 +139,7 @@ if (dryRun) {
 }
 
 function agentStartArgsForDryRun() {
-  const args = ["agent", "start", `sdd-agent-<ts>`, "--kind", "agy", "--pane", "<pane>"];
+  const args = ["agent", "start", isTask ? `agy-task-${taskKind}-<ts>` : "sdd-agent-<ts>", "--kind", "agy", "--pane", "<pane>"];
   const cli = [];
   if (model) cli.push("--model", String(model));
   if (effort && modelSupportsEffortFlag(model)) cli.push("--effort", String(effort));
@@ -122,12 +153,11 @@ function agentStartArgsForDryRun() {
 let activeCwd = cwd;
 
 const workspaceId = process.env.HERDR_WORKSPACE_ID || "default";
-const label = `sdd-${phase}-${change}`;
+const label = isTask ? effectiveLabel : `sdd-${phase}-${change}`;
 const tabRes = spawnSync("herdr", ["tab", "create", "--workspace", workspaceId, "--cwd", activeCwd, "--label", label], { encoding: "utf8" });
 if (tabRes.status !== 0) {
   die(4, "Failed to create tab: " + tabRes.stderr);
 }
-let tabId, paneId;
 try {
   const tabData = JSON.parse(tabRes.stdout);
   tabId = tabData.result?.tab?.tab_id || tabData.result?.root_pane?.tab_id;
@@ -139,7 +169,7 @@ if (!tabId || !paneId) {
   die(4, "tab create response missing tab_id/pane_id: " + tabRes.stdout);
 }
 
-const agentName = `sdd-agent-${Date.now()}`;
+const agentName = isTask ? `agy-task-${taskKind}-${Date.now()}` : `sdd-agent-${Date.now()}`;
 const agentStartArgs = ["agent", "start", agentName, "--kind", "agy", "--pane", paneId];
 // Pass model/effort through to the agy CLI via the trailing `--` agent args.
 // Without this, agy starts with its own default model (e.g. Gemini 3.7 Flash
@@ -166,19 +196,7 @@ const promptWithSentinel = `${promptText}\n\nIMPORTANT: when finished, write you
 
 const promptTimeoutMs = parseTimeoutMs(timeoutArg) || 10 * 60 * 1000;
 const promptArgs = ["agent", "prompt", agentTarget, promptWithSentinel, "--wait", "--timeout", String(promptTimeoutMs)];
-let child = null;
 
-// herdr's --wait requires an observed state change within 5s of submission.
-// Right after `agent start`, agy is still warming up: the first prompt
-// typically returns agent_prompt_stalled/timeout (exit 1). Retrying a few
-// times with a short pause lets the agent reach interactive_ready, after
-// which the same prompt completes with exit 0 and state done.
-//
-// agy can also answer with an account-verification notice
-// ("Verifying your account... Please try again shortly") while the account
-// eligibility check is still finishing. That is transient, not a contract
-// failure: we retry with a longer backoff and only report `unavailable`
-// (retryable by the orchestrator) once the verification attempts run out.
 let promptAttempt = 0;
 const MAX_PROMPT_ATTEMPTS = 3;
 const VERIFY_PATTERN = /verifying your account|account eligibility|try again shortly/i;
@@ -189,157 +207,66 @@ const MAX_VERIFY_ATTEMPTS = Number(process.env.GGA_HERDR_MAX_VERIFY_ATTEMPTS || 
 let promptOutput = "";
 let verifyMode = false;
 
-function agentState() {
+function tryReadSentinel() {
+  if (!existsSync(sentinelFile)) return null;
+  try {
+    const raw = readFileSync(sentinelFile, "utf8");
+    if (!raw.trim()) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function getAgentInfo() {
   const res = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
-  if (res.status !== 0) return "";
+  if (res.status !== 0) return null;
   try {
     const d = JSON.parse(res.stdout);
-    return d.result?.agent?.agent_status || "";
-  } catch (e) { return ""; }
-}
-
-function launchPrompt() {
-  promptAttempt++;
-  promptOutput = "";
-  child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  child.stdout.on("data", (d) => { promptOutput += d; process.stdout.write(d); });
-  child.stderr.on("data", (d) => { promptOutput += d; process.stderr.write(d); });
-  child.on("close", (code) => {
-    const state = agentState();
-    if (VERIFY_PATTERN.test(promptOutput)) verifyMode = true;
-    const maxAttempts = verifyMode ? MAX_VERIFY_ATTEMPTS : MAX_PROMPT_ATTEMPTS;
-    const delay = verifyMode ? VERIFY_RETRY_MS : RETRY_MS;
-    if ((code !== 0 || state !== "done") && promptAttempt < maxAttempts) {
-      setTimeout(launchPrompt, delay);
-      return;
-    }
-    if (verifyMode && promptAttempt >= maxAttempts) {
-      cleanupAgent();
-      die(4, "Account verification pending: " + (promptOutput.trim().split("\n")[0] || "agy is verifying the account"), { error_class: "unavailable", stall_reason: "account_verification", attempts: promptAttempt });
-      return;
-    }
-    onPromptClose(code);
-  });
-}
-
-launchPrompt();
-
-let lastSeq = null;
-let lastRevision = null;
-let noActivityTime = 0;
-let tier1Passed = false;
-let blocked = false;
-
-// Startup: agy may take a while to become ready (model spin-up, account check).
-// Inactivity: never kill before the prompt's own --timeout gets a chance —
-// the prompt is the authority; the poll is only a backstop. If the agent is
-// genuinely working (state_change_seq advancing or status == "working") we
-// never treat it as inactive, even when `revision` stays flat.
-const STARTUP_TIMEOUT_MS = 60000;
-const INACTIVITY_TIMEOUT_MS = Math.max(promptTimeoutMs, 120000);
-
-// Best-effort cleanup so a timed-out run does not leave the agy agent alive
-// in the tab working on the same files (duplicate work / zombie agent).
-function cleanupAgent() {
-  try {
-    if (tabId) spawnSync("herdr", ["tab", "close", tabId], { encoding: "utf8" });
-  } catch (e) {}
-}
-
-const pollInterval = setInterval(() => {
-  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
-  if (statusRes.status === 0) {
-    try {
-      const data = JSON.parse(statusRes.stdout);
-      const agent = data.result?.agent || data.agent || {};
-      const seq = agent.state_change_seq;
-      const rev = agent.revision;
-      const status = agent.agent_status;
-      // Real activity: any state-change sequence advance, revision change, or
-      // the agent actively working. agy keeps state_change_seq advancing while
-      // it works even when `revision` stays flat.
-      const active = status === "working" || seq !== lastSeq || rev !== lastRevision;
-      if (seq !== lastSeq) lastSeq = seq;
-      if (rev !== lastRevision) lastRevision = rev;
-      if (active) {
-        noActivityTime = 0;
-        tier1Passed = true;
-      } else {
-        noActivityTime += 10000;
-        if (!tier1Passed && noActivityTime >= STARTUP_TIMEOUT_MS && !verifyMode) {
-          clearInterval(pollInterval);
-          if (child) child.kill();
-          cleanupAgent();
-          die(8, "Startup timeout", { error_class: "stalled", stall_reason: "startup_timeout" });
-        }
-        if (tier1Passed && noActivityTime >= INACTIVITY_TIMEOUT_MS && !verifyMode) {
-          clearInterval(pollInterval);
-          if (child) child.kill();
-          cleanupAgent();
-          die(8, "Inactivity timeout", { error_class: "stalled", stall_reason: "inactivity_timeout" });
-        }
-      }
-
-      if (agent.agent_status === "blocked" && !blocked) {
-        blocked = true;
-        const envelope = { status: "blocked", error_class: "permission_required", message: "Agent blocked." };
-        process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
-        setTimeout(() => {
-          clearInterval(pollInterval);
-          if (child) child.kill();
-          cleanupAgent();
-          die(7, "Blocked timeout", { error_class: "blocked_timeout" });
-        }, 300000);
-      }
-    } catch (e) {}
+    return d.result?.agent || d.agent || null;
+  } catch (e) {
+    return null;
   }
-}, 10000);
+}
 
-function onPromptClose(code) {
-  clearInterval(pollInterval);
-  
-  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
+function completeWithResult(parsed) {
+  if (finished) return;
+  finished = true;
+  if (pollInterval) clearInterval(pollInterval);
+  if (child) {
+    try { child.kill(); } catch (e) {}
+  }
+
+  const agent = getAgentInfo();
   let conversationId = null;
-  if (statusRes.status === 0) {
-    try {
-      const data = JSON.parse(statusRes.stdout);
-      const agent = data.result?.agent || data.agent || {};
-      conversationId = agent.agent_session?.value || agent.conversationId || data.conversationId;
-    } catch(e){}
+  if (agent) {
+    conversationId = agent.agent_session?.value || agent.conversationId;
   }
-  
+
   if (conversationId) {
     // engram CLI shape: engram save <title> <msg> [--type TYPE] [--project PROJECT] [--scope SCOPE]
-    const memArgs = ["save", `conversationId ${phase} ${change}`, conversationId, "--type", "architecture", "--project", project, "--scope", "project"];
+    const memArgs = [
+      "save",
+      isTask ? `conversationId task ${taskKind}` : `conversationId ${phase} ${change}`,
+      conversationId,
+      "--type", "architecture",
+      "--project", project,
+      "--scope", "project"
+    ];
     spawnSync("engram", memArgs);
   }
 
-  if (!existsSync(sentinelFile)) {
-    cleanupAgent();
-    die(5, "Contract violation: result file not found");
-  }
-  
-  const resultData = readFileSync(sentinelFile, "utf8");
-  let parsed;
-  try {
-    parsed = JSON.parse(resultData);
-  } catch (e) {
-    cleanupAgent();
-    die(5, "Contract violation: invalid JSON in result file");
-  }
-  
   let inner = parsed.response || parsed;
   const ok = inner && inner.status !== "failed" && inner.status !== "ERROR";
 
   const envelope = {
     ...inner, // Flatten inner fields
     status: ok ? "success" : "failed",
-    error_class: ok ? null : "contract",
+    error_class: ok ? null : (inner?.error_class || "contract"),
     exit_code: ok ? 0 : 5,
     result: inner,
     worker: "agy",
-    phase,
-    change_name: change,
+    ...(isTask ? { task_kind: taskKind, task_label: effectiveLabel } : { phase, change_name: change }),
     project,
     cwd,
     transport: "herdr",
@@ -349,13 +276,186 @@ function onPromptClose(code) {
     conversation_id: conversationId,
     tab_id: tabId
   };
-  
+
   process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
-  
-  spawnSync("herdr", ["tab", "close", tabId]);
-  
+
+  cleanupAgent();
+
   exitForEnvelope(envelope);
 }
+
+function launchPrompt() {
+  if (finished) return;
+  promptAttempt++;
+  promptOutput = "";
+  child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.on("data", (d) => { promptOutput += d; process.stdout.write(d); });
+  child.stderr.on("data", (d) => { promptOutput += d; process.stderr.write(d); });
+  child.on("close", (code) => {
+    child = null;
+    if (finished) return;
+
+    // Check account verification notice first
+    if (VERIFY_PATTERN.test(promptOutput)) {
+      verifyMode = true;
+      if (promptAttempt < MAX_VERIFY_ATTEMPTS) {
+        setTimeout(launchPrompt, VERIFY_RETRY_MS);
+        return;
+      }
+      die(4, "Account verification pending: " + (promptOutput.trim().split("\n")[0] || "agy is verifying the account"), {
+        error_class: "unavailable",
+        stall_reason: "account_verification",
+        attempts: promptAttempt
+      });
+      return;
+    }
+
+    const sentinel = tryReadSentinel();
+    if (sentinel) {
+      completeWithResult(sentinel);
+      return;
+    }
+
+    // Prompt closed (code 0, agent_prompt_stalled after 5s, or non-zero).
+    // Treat the 5-second wait handshake as inconclusive: check agent status.
+    const agent = getAgentInfo();
+    if (!agent) {
+      return;
+    }
+
+    const terminalDeadStates = new Set(["crashed", "failed", "error", "killed", "stopped", "terminated", "exited"]);
+    if (terminalDeadStates.has(agent.agent_status)) {
+      const lastCheck = tryReadSentinel();
+      if (lastCheck) {
+        completeWithResult(lastCheck);
+        return;
+      }
+      die(4, `Agent in terminal dead state: ${agent.agent_status}`, { error_class: "unavailable", agent_status: agent.agent_status });
+      return;
+    }
+
+    if (agent.agent_status === "done") {
+      const lastCheck = tryReadSentinel();
+      if (lastCheck) {
+        completeWithResult(lastCheck);
+        return;
+      }
+      setTimeout(() => {
+        if (finished) return;
+        const res = tryReadSentinel();
+        if (res) {
+          completeWithResult(res);
+        } else {
+          die(5, "Contract violation: result file not found", { error_class: "contract" });
+        }
+      }, 1000);
+      return;
+    }
+
+    // Agent is alive (working / idle warming up).
+    // Do NOT submit duplicate prompt. Polling will reconcile and wait for completion.
+  });
+}
+
+let lastSeq = null;
+let lastRevision = null;
+let noActivityTime = 0;
+let tier1Passed = false;
+let blocked = false;
+
+const STARTUP_TIMEOUT_MS = Number(process.env.GGA_HERDR_STARTUP_TIMEOUT_MS || 60000);
+const INACTIVITY_TIMEOUT_MS = Number(process.env.GGA_HERDR_INACTIVITY_TIMEOUT_MS || Math.max(promptTimeoutMs, 120000));
+const POLL_INTERVAL_MS = Number(process.env.GGA_HERDR_POLL_INTERVAL_MS || 2000);
+
+function checkStatus() {
+  if (finished) return;
+
+  const sentinel = tryReadSentinel();
+  if (sentinel) {
+    completeWithResult(sentinel);
+    return;
+  }
+
+  const agent = getAgentInfo();
+  if (!agent) {
+    if (!child && tier1Passed) {
+      noActivityTime += POLL_INTERVAL_MS;
+      if (noActivityTime >= INACTIVITY_TIMEOUT_MS && !verifyMode) {
+        die(8, "Agent unreachable / Inactivity timeout", { error_class: "stalled", stall_reason: "inactivity_timeout" });
+      }
+    }
+    return;
+  }
+
+  const seq = agent.state_change_seq;
+  const rev = agent.revision;
+  const status = agent.agent_status;
+
+  const terminalDeadStates = new Set(["crashed", "failed", "error", "killed", "stopped", "terminated", "exited"]);
+  if (terminalDeadStates.has(status)) {
+    const lastCheck = tryReadSentinel();
+    if (lastCheck) {
+      completeWithResult(lastCheck);
+      return;
+    }
+    die(4, `Agent terminated unexpectedly: ${status}`, { error_class: "unavailable", agent_status: status });
+    return;
+  }
+
+  if (status === "done") {
+    const lastCheck = tryReadSentinel();
+    if (lastCheck) {
+      completeWithResult(lastCheck);
+      return;
+    }
+    const graceMs = Math.min(1000, POLL_INTERVAL_MS * 2);
+    setTimeout(() => {
+      if (finished) return;
+      const res = tryReadSentinel();
+      if (res) {
+        completeWithResult(res);
+      } else {
+        die(5, "Contract violation: result file not found", { error_class: "contract" });
+      }
+    }, graceMs);
+    return;
+  }
+
+  const seqChanged = lastSeq !== null && seq !== undefined && seq !== null && seq !== lastSeq;
+  const revChanged = lastRevision !== null && rev !== undefined && rev !== null && rev !== lastRevision;
+  const active = status === "working" || seqChanged || revChanged;
+  if (seq !== undefined && seq !== null) lastSeq = seq;
+  if (rev !== undefined && rev !== null) lastRevision = rev;
+
+  if (active) {
+    noActivityTime = 0;
+    tier1Passed = true;
+  } else {
+    noActivityTime += POLL_INTERVAL_MS;
+    if (!tier1Passed && noActivityTime >= STARTUP_TIMEOUT_MS && !verifyMode) {
+      die(8, "Startup timeout", { error_class: "stalled", stall_reason: "startup_timeout" });
+      return;
+    }
+    if (tier1Passed && noActivityTime >= INACTIVITY_TIMEOUT_MS && !verifyMode) {
+      die(8, "Inactivity timeout", { error_class: "stalled", stall_reason: "inactivity_timeout" });
+      return;
+    }
+  }
+
+  if (status === "blocked" && !blocked) {
+    blocked = true;
+    const envelope = { status: "blocked", error_class: "permission_required", message: "Agent blocked." };
+    process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
+    setTimeout(() => {
+      if (!finished) {
+        die(7, "Blocked timeout", { error_class: "blocked_timeout" });
+      }
+    }, 300000);
+  }
+}
+
+pollInterval = setInterval(checkStatus, POLL_INTERVAL_MS);
+launchPrompt();
 
 function exitForEnvelope(envelope) {
   if (envelope.status === "success") process.exit(0);
