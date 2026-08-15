@@ -116,16 +116,10 @@ function agentStartArgsForDryRun() {
   return args;
 }
 
+// Apply runs in the main worktree like every other phase. No herdr worktree
+// isolation: git itself is the safety net (diff/checkout), and the RDD
+// correction transaction expects candidate changes in the lineage repo.
 let activeCwd = cwd;
-let worktreePath = null;
-if (phase === "apply") {
-  const wtRes = spawnSync("herdr", ["worktree", "create", "--cwd", cwd], { encoding: "utf8" });
-  if (wtRes.status !== 0) {
-    die(4, "Failed to create worktree: " + wtRes.stderr);
-  }
-  worktreePath = wtRes.stdout.trim();
-  activeCwd = worktreePath;
-}
 
 const workspaceId = process.env.HERDR_WORKSPACE_ID || "default";
 const label = `sdd-${phase}-${change}`;
@@ -359,10 +353,6 @@ function onPromptClose(code) {
   process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
   
   spawnSync("herdr", ["tab", "close", tabId]);
-  
-  if (phase === "apply" && worktreePath && envelope.status === "success") {
-    spawnSync("herdr", ["worktree", "remove", worktreePath]);
-  }
   
   exitForEnvelope(envelope);
 }
