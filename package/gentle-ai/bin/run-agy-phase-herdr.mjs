@@ -93,20 +93,69 @@ const tabRes = spawnSync("herdr", ["tab", "create", "--workspace", workspaceId, 
 if (tabRes.status !== 0) {
   die(4, "Failed to create tab: " + tabRes.stderr);
 }
-let tabId = tabRes.stdout.trim();
+let tabId, paneId;
+try {
+  const tabData = JSON.parse(tabRes.stdout);
+  tabId = tabData.result?.tab?.tab_id || tabData.result?.root_pane?.tab_id;
+  paneId = tabData.result?.root_pane?.pane_id;
+} catch (e) {
+  die(4, "Failed to parse tab create response: " + tabRes.stdout);
+}
+if (!tabId || !paneId) {
+  die(4, "tab create response missing tab_id/pane_id: " + tabRes.stdout);
+}
 
-const agentRes = spawnSync("herdr", ["agent", "start", `sdd-agent-${Date.now()}`, "--kind", "agy"], { encoding: "utf8" });
+const agentName = `sdd-agent-${Date.now()}`;
+const agentRes = spawnSync("herdr", ["agent", "start", agentName, "--kind", "agy", "--pane", paneId], { encoding: "utf8" });
 if (agentRes.status !== 0) {
   die(4, "Failed to start agent: " + agentRes.stderr);
 }
-const agentTarget = agentRes.stdout.trim();
+let agentTarget = agentName;
+try {
+  const agentData = JSON.parse(agentRes.stdout);
+  agentTarget = agentData.result?.agent?.name || agentData.result?.agent?.target || agentName;
+} catch (e) {
+  // plain text target (older CLI)
+  agentTarget = agentRes.stdout.trim() || agentName;
+}
 
 const sentinelFile = join(tmpdir(), `agy_result_${Date.now()}.json`);
-const promptFileSafe = join(tmpdir(), `agy_prompt_${Date.now()}.txt`);
-writeFileSync(promptFileSafe, `${promptText}\n\n--output-format json --output-file ${sentinelFile}`);
+const promptWithSentinel = `${promptText}\n\nIMPORTANT: when finished, write your structured result JSON to exactly this path (overwrite the file, absolute path):\n${sentinelFile}\n`;
 
-const promptArgs = ["agent", "prompt", agentTarget, "--prompt-file", promptFileSafe, "--wait"];
-const child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: "inherit" });
+const promptArgs = ["agent", "prompt", agentTarget, promptWithSentinel, "--wait", "--timeout", String(10 * 60 * 1000)];
+let child = null;
+
+// herdr's --wait requires an observed state change within 5s of submission.
+// Right after `agent start`, agy is still warming up: the first prompt
+// typically returns agent_prompt_stalled/timeout (exit 1). Retrying a few
+// times with a short pause lets the agent reach interactive_ready, after
+// which the same prompt completes with exit 0 and state done.
+let promptAttempt = 0;
+const MAX_PROMPT_ATTEMPTS = 3;
+
+function agentState() {
+  const res = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
+  if (res.status !== 0) return "";
+  try {
+    const d = JSON.parse(res.stdout);
+    return d.result?.agent?.agent_status || "";
+  } catch (e) { return ""; }
+}
+
+function launchPrompt() {
+  promptAttempt++;
+  child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: "inherit" });
+  child.on("close", (code) => {
+    const state = agentState();
+    if ((code !== 0 || state !== "done") && promptAttempt < MAX_PROMPT_ATTEMPTS) {
+      setTimeout(launchPrompt, 3000);
+      return;
+    }
+    onPromptClose(code);
+  });
+}
+
+launchPrompt();
 
 let lastRevision = null;
 let noActivityTime = 0;
@@ -114,11 +163,12 @@ let tier1Passed = false;
 let blocked = false;
 
 const pollInterval = setInterval(() => {
-  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget, "--format", "json"], { encoding: "utf8" });
+  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
   if (statusRes.status === 0) {
     try {
       const data = JSON.parse(statusRes.stdout);
-      const rev = data.revision;
+      const agent = data.result?.agent || data.agent || {};
+      const rev = agent.revision;
       if (rev !== lastRevision) {
         lastRevision = rev;
         noActivityTime = 0;
@@ -137,7 +187,7 @@ const pollInterval = setInterval(() => {
         }
       }
       
-      if (data.state === "blocked" && !blocked) {
+      if (agent.agent_status === "blocked" && !blocked) {
         blocked = true;
         const envelope = { status: "blocked", error_class: "permission_required", message: "Agent blocked." };
         process.stdout.write(JSON.stringify(envelope, null, 2) + "\n");
@@ -149,20 +199,22 @@ const pollInterval = setInterval(() => {
   }
 }, 10000);
 
-child.on("close", (code) => {
+function onPromptClose(code) {
   clearInterval(pollInterval);
   
-  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget, "--format", "json"], { encoding: "utf8" });
+  const statusRes = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
   let conversationId = null;
   if (statusRes.status === 0) {
     try {
       const data = JSON.parse(statusRes.stdout);
-      conversationId = data.agent_session?.value || data.conversationId;
+      const agent = data.result?.agent || data.agent || {};
+      conversationId = agent.agent_session?.value || agent.conversationId || data.conversationId;
     } catch(e){}
   }
   
   if (conversationId) {
-    const memArgs = ["save", "--project", project, "--topic_key", `sdd/${change}/bridge/${phase}`, "--type", "architecture", "--content", conversationId, "--capture_prompt", "false"];
+    // engram CLI shape: engram save <title> <msg> [--type TYPE] [--project PROJECT] [--scope SCOPE]
+    const memArgs = ["save", `conversationId ${phase} ${change}`, conversationId, "--type", "architecture", "--project", project, "--scope", "project"];
     spawnSync("engram", memArgs);
   }
 
@@ -206,7 +258,7 @@ child.on("close", (code) => {
   }
   
   exitForEnvelope(envelope);
-});
+}
 
 function exitForEnvelope(envelope) {
   if (envelope.status === "success") process.exit(0);
