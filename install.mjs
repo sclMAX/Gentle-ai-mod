@@ -489,6 +489,13 @@ function runCheck() {
     critical++;
   }
 
+  const herdrRunner = homeConfig("gentle-ai", "bin", "run-agy-phase-herdr.mjs");
+  if (existsSync(herdrRunner)) pass(`herdr runner: ${herdrRunner}`);
+  else {
+    fail(`herdr runner missing: ${herdrRunner}`);
+    critical++;
+  }
+
   // schema
   const schema = homeConfig(
     "gentle-ai",
