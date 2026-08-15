@@ -130,8 +130,21 @@ let child = null;
 // typically returns agent_prompt_stalled/timeout (exit 1). Retrying a few
 // times with a short pause lets the agent reach interactive_ready, after
 // which the same prompt completes with exit 0 and state done.
+//
+// agy can also answer with an account-verification notice
+// ("Verifying your account... Please try again shortly") while the account
+// eligibility check is still finishing. That is transient, not a contract
+// failure: we retry with a longer backoff and only report `unavailable`
+// (retryable by the orchestrator) once the verification attempts run out.
 let promptAttempt = 0;
 const MAX_PROMPT_ATTEMPTS = 3;
+const VERIFY_PATTERN = /verifying your account|account eligibility|try again shortly/i;
+const VERIFY_RETRY_MS = Number(process.env.GGA_HERDR_VERIFY_RETRY_MS || 15000);
+const RETRY_MS = Number(process.env.GGA_HERDR_RETRY_MS || 3000);
+const MAX_VERIFY_ATTEMPTS = Number(process.env.GGA_HERDR_MAX_VERIFY_ATTEMPTS || 5);
+
+let promptOutput = "";
+let verifyMode = false;
 
 function agentState() {
   const res = spawnSync("herdr", ["agent", "get", agentTarget], { encoding: "utf8" });
@@ -144,11 +157,21 @@ function agentState() {
 
 function launchPrompt() {
   promptAttempt++;
-  child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: "inherit" });
+  promptOutput = "";
+  child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.on("data", (d) => { promptOutput += d; process.stdout.write(d); });
+  child.stderr.on("data", (d) => { promptOutput += d; process.stderr.write(d); });
   child.on("close", (code) => {
     const state = agentState();
-    if ((code !== 0 || state !== "done") && promptAttempt < MAX_PROMPT_ATTEMPTS) {
-      setTimeout(launchPrompt, 3000);
+    if (VERIFY_PATTERN.test(promptOutput)) verifyMode = true;
+    const maxAttempts = verifyMode ? MAX_VERIFY_ATTEMPTS : MAX_PROMPT_ATTEMPTS;
+    const delay = verifyMode ? VERIFY_RETRY_MS : RETRY_MS;
+    if ((code !== 0 || state !== "done") && promptAttempt < maxAttempts) {
+      setTimeout(launchPrompt, delay);
+      return;
+    }
+    if (verifyMode && promptAttempt >= maxAttempts) {
+      die(4, "Account verification pending: " + (promptOutput.trim().split("\n")[0] || "agy is verifying the account"), { error_class: "unavailable", stall_reason: "account_verification", attempts: promptAttempt });
       return;
     }
     onPromptClose(code);
@@ -175,7 +198,10 @@ const pollInterval = setInterval(() => {
         tier1Passed = true;
       } else {
         noActivityTime += 10000;
-        if (!tier1Passed && noActivityTime >= 10000) {
+        // While agy is verifying the account, the agent revision may not
+        // advance for a while. Do not kill on the fast startup timeout in
+        // verifyMode — the verification retry loop owns the outcome.
+        if (!tier1Passed && noActivityTime >= 10000 && !verifyMode) {
           clearInterval(pollInterval);
           child.kill();
           die(8, "Startup timeout", { error_class: "stalled", stall_reason: "startup_timeout" });
