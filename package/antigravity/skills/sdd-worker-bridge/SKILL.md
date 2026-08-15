@@ -1,22 +1,24 @@
 ---
 name: sdd-worker-bridge
-description: "SDD worker bridge for agy vs OpenCode phase runners. Trigger: SDD phase launch, agy worker, model/effort selection, quota failover, run-agy-phase, worker policy."
+description: "Universal worker bridge v2 — Antigravity (agy) vs OpenCode for ANY delegated sub-agent (SDD phase or task). Trigger: sub-agent launch, worker selection, agy model catalog + recommendation, model/effort selection, quota chain failover, run-agy-phase, worker policy."
 license: MIT
 metadata:
   author: gentle-ai-local
-  version: "1.3"
+  version: "2.0"
 ---
 
-# SDD Worker Bridge (Orchestrator only)
+# Worker Bridge v2 — Universal Worker Selection (Orchestrator only)
 
 Bind this to `gentle-orchestrator` only. Executors (`sdd-explore`, etc.) do not load this to re-orchestrate.
 
 ## Purpose
 
-Run eligible SDD phases on either:
+Run ANY delegated sub-agent (SDD phase or task) on either:
 
 - **opencode** — native `task` + `sdd-<phase>` subagent
 - **agy** — Antigravity CLI via portable runner
+
+Universal selector: ask worker, recommend agy model+effort, walk the model chain on quota.
 
 Same artifact contract. One orchestrator. Failover on quota.
 
@@ -46,6 +48,7 @@ session.worker_policy   # from preflight
 session.workers.agy     = { available, exhausted:false }
 session.workers.opencode = { available:true, exhausted:false }
 session.phase_bindings  = {}
+session.task_bindings   = {}   # non-SDD delegated tasks (fingerprint → binding)
 session.failover_count  = {}
 session.retry_same      = {}
 session.agy_models      = []
@@ -83,6 +86,7 @@ Before every phase launch, follow `references/phase-launch-checklist.md`.
 ```text
 binding = { worker, model, effort, source }
 
+// SDD phase:
 if phase ineligible → worker=opencode
 else if phase_bindings[phase] on retry/failover → reuse (no re-ask)
 else if policy opencode-only → opencode
@@ -90,19 +94,19 @@ else if policy agy-only → agy or STOP
 else if policy ask-each-phase and interactive → question tool (worker) then STOP if unanswered
 else if prefer-agy → first_available([agy, opencode])
 else if prefer-opencode → first_available([opencode, agy])
+
+// Non-SDD delegated task (explore/general/writer):
+same rules against task_bindings[task-fingerprint]
 ```
 
-### Model / effort (agy only)
+### Model / effort — universal selector (agy only)
 
 ```text
-model  = override ?? binding ?? model_by_phase[phase] ?? default_model ?? omit
-effort = override ?? binding ?? effort_by_phase[phase] ?? default_effort ?? omit
+model  = override ?? binding ?? model_by_phase[phase] ?? recommend_by_task[task_kind] ?? default_model ?? omit
+effort = override ?? binding ?? effort_by_phase[phase] ?? recommend_by_task[task_kind].effort ?? default_effort ?? omit
 ```
 
-If `model_picker=on-agy-ask` and worker freshly chosen as agy and no model set and interactive:
-
-- Ask **profile** once: Fast / Balanced / Strong (from config `workers.agy.profiles`)
-- Do not dump full model catalog
+Universal selector (v2): if `model_picker=on-agy-ask` and worker freshly chosen as agy and no model set and interactive — list the REAL available models from `session.agy_models` in the `question` tool, with the RECOMMENDED one first (label ends '(Recomendado)'). Recommendation source: `workers.agy.recommend_by_task[task_kind]` (read/write/design/heavy) falling back to `model_by_phase[phase]`. User accepts or picks another. STOP until answered. Never dump a fixed 3-profile list.
 
 OpenCode models stay on `opencode.json` `agent.sdd-<phase>.model`.
 
@@ -146,8 +150,8 @@ PASS only if:
 ### Failover
 
 1. **contract/gate fail** → 1× same worker with corrective prompt  
-2. **agy + quota/unavailable** + `try_model_fallback_once` → 1× next `model_fallback`  
-3. **other worker** once if allowed and available  
+2. **agy + quota_exceeded** + `walk_model_fallback_chain` → walk the WHOLE `model_fallback` list in order: same worker, next model each time, until one succeeds  
+3. **entire agy chain quota-failed / agy unavailable** → other worker once (mark agy exhausted)  
 4. else STOP and report
 
 On `quota_exceeded` for a worker after model fallback exhausted (or no fallback): mark `workers[w].exhausted=true` for the session when switching away.
@@ -229,8 +233,8 @@ node /path/to/Gentle-ai-mod/install.mjs --check
 
 1. One orchestrator (OpenCode gentle-orchestrator)
 2. One active writer worker per phase
-3. ≤1 worker question per phase per run
-4. ≤1 profile question when applicable
+3. ≤1 worker question per launch
+4. ≤1 model question per launch (universal selector)
 5. Store beats stdout
 6. No absolute cross-machine paths in committed config
 7. review lifecycle gates and commit/PR run on the orchestrator (OpenCode), never agy

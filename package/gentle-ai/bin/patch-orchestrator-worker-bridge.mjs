@@ -12,47 +12,62 @@ copyFileSync(cfgPath, bakPath);
 
 const BRIDGE_SECTION = `
 <!-- gentle-ai:sdd-worker-bridge -->
-### SDD Worker Bridge (HARD GATE)
+### Worker Bridge v2 — Universal Worker Selection (HARD GATE)
 
-Before launching any eligible SDD phase, follow the worker bridge. Load skill \`sdd-worker-bridge\` (read its SKILL.md and \`references/phase-launch-checklist.md\`) at session start after preflight, and on every phase launch if not cached.
+Before launching ANY sub-agent (SDD phase or delegated task: explore/general/writer for reads, writes, research, commands), follow the worker bridge. Load skill \`sdd-worker-bridge\` (read its SKILL.md and \`references/phase-launch-checklist.md\`) at session start after preflight, and on every launch if not cached.
 
 **Portable files (never hardcode machine-specific paths in repo commits):**
 - Config: \`~/.config/gentle-ai/workers.yaml\` (optional override: \`<repo>/.atl/sdd-workers.yaml\`)
 - Runner: \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs\`
 - Skill: opencode skills \`sdd-worker-bridge\`
 
-**Roles:** OpenCode \`gentle-orchestrator\` = only orchestrator. Workers: \`opencode\` (native \`task\` + \`sdd-<phase>\`) or \`agy\` (Antigravity CLI via runner). Workers never route the pipeline.
+**Roles:** OpenCode \`gentle-orchestrator\` = only orchestrator. Workers: \`opencode\` (native \`task\` + subagent) or \`agy\` (Antigravity CLI via runner). Workers never route the pipeline.
 
-**Eligible phases:** all SDD phases — explore, propose, spec, design, tasks, apply, verify, archive, init, onboard.
-**Always OpenCode (orchestrator-only):** review lifecycle, commit/PR.
+**Scope:** ALL sub-agent launches — SDD phases (explore, propose, spec, design, tasks, apply, verify, archive, init, onboard) AND delegated tasks (explore/general/writer). Review lifecycle + commit/PR stay on OpenCode (orchestrator-only).
 
 **Session state after preflight:**
 \`\`\`
 session.worker_policy
 session.workers.agy = { available, exhausted }
 session.workers.opencode = { available, exhausted }
-session.phase_bindings = { phase → { worker, model, effort, source } }
+session.phase_bindings = { phase → { worker, model, effort, source } }   // SDD
+session.task_bindings   = { fingerprint → { worker, model, effort } }    // non-SDD
 session.failover_count / retry_same
 session.agy_models (cached from \`agy models\` when available)
 \`\`\`
 
-**Bootstrap once:** read workers.yaml; detect agy on PATH; cache models; apply degradations (no agy → opencode-only; ask-each-phase+auto → prefer-agy|prefer-opencode).
+**Bootstrap once:** read workers.yaml; detect agy on PATH; cache \`agy models\`; apply degradations (no agy → opencode-only; ask-each-phase+auto → prefer-agy|prefer-opencode).
 
-**Per phase launch:**
-1. Resolve binding (worker/model/effort) per policy — see skill checklist.
-2. If \`ask-each-phase\` and interactive and no binding yet: use \`question\` tool for worker (Antigravity vs OpenCode). STOP until answered. Do not re-ask on failover/retry.
-3. If worker=agy and \`model_picker=on-agy-ask\` and model unset: optional profile question (Fast/Balanced/Strong) mapped from config profiles — not a full model dump.
-4. Run:
-   - opencode → \`task(subagent_type: sdd-<phase>, prompt: ...)\` with skills injected
-   - agy → write prompt file then:
-     \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase <p> --change <c> --project <proj> --cwd <git_root> --artifact-store <mode> --prompt-file <file> [--model] [--effort]\`
-5. Gatekeeper: Engram/OpenSpec artifact is authority; stdout envelope is a hint only.
-6. Failover: (1) contract → same worker once (2) agy quota/unavailable → model_fallback once (3) other worker once (4) STOP. On quota when leaving a worker, mark exhausted for the session.
-7. Summary line: \`phase · worker · model · effort · duration · status · failover?\`
+**Universal pre-launch (every sub-agent):**
+1. Ask worker FIRST: use \`question\` tool → Antigravity (agy) vs OpenCode. STOP until answered. Honor explicit user overrides ("use agy" / "use opencode"). Do not re-ask on failover/retry — binding frozen.
+2. If worker=agy and \`model_picker=on-agy-ask\` and no model set: list the REAL available models (from \`session.agy_models\` cache) and RECOMMEND model+effort for the task (see heuristic below). The recommended option is FIRST with "(Recomendado)". User accepts the recommendation or picks another from the catalog. STOP until answered.
+3. Freeze the binding per (phase | task-fingerprint); never re-ask the same launch.
+
+**Model recommendation heuristic (agy):**
+- Read / explore / map / research task → \`gemini-3.6-flash-medium\` (effort medium) — cheap and fast
+- Write / apply / implement task → \`gemini-3.1-pro-high\` (effort high) — strongest writer
+- Design / reason / verify task → \`claude-sonnet-4-6\` (no effort flag; runner strips it) — strong reasoning
+- Heavy / adversarial task → \`claude-opus-4-6-thinking\` (no effort flag) — strongest
+- Fallbacks when the recommended model is quota-blocked, in order: \`gemini-3.7-flash-high\` → \`gemini-3.6-flash-high\` → \`gemini-3.1-pro-high\` → \`gemini-3.6-flash-medium\`.
+
+**Run:**
+- opencode → \`task(subagent_type: <type>, prompt: ...)\` with skills injected
+- agy → write prompt file then:
+  \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase <p> --change <c> --project <proj> --cwd <git_root> --artifact-store <mode> --prompt-file <file> [--model] [--effort]\` (SDD) or the runner equivalent for the delegated task (non-SDD)
+
+**Gatekeeper:** Engram/OpenSpec artifact is authority; stdout envelope is a hint only.
+
+**Failover (quota-aware, walk the model chain):**
+1. contract → same worker once
+2. agy \`quota_exceeded\` → walk the whole \`model_fallback\` chain IN ORDER (every model in the list, not just one): retry same worker with the next model until one succeeds. No re-ask.
+3. entire agy chain quota-failed / agy unavailable → other worker once (mark agy exhausted)
+4. STOP
+
+**Summary line:** \`phase · worker · model · effort · duration · status · failover?\`
 
 **User overrides:** honor "use agy", "use opencode", model/effort phrases, and "try agy again" (clears exhausted).
 
-**Invariants:** one orchestrator; one worker at a time; store wins; commit/PR + review lifecycle stay on OpenCode; no cross-machine absolute paths; dedup launches.
+**Invariants:** one orchestrator; one worker at a time; store wins; commit/PR + review lifecycle stay on OpenCode; no cross-machine absolute paths; dedup launches; ≤1 worker question and ≤1 model question per launch.
 <!-- /gentle-ai:sdd-worker-bridge -->
 `;
 

@@ -94,9 +94,11 @@ workers:
     # Optional per-phase effort overrides (only applied when model supports effort
     # and has no -low|-medium|-high suffix). Prefer leaving unset.
     effort_by_phase: {}
-    # Tried once on quota/unavailable before switching worker
+    # Walked in order on quota_exceeded — every model tried before switching worker (v2)
     model_fallback:
+      - gemini-3.7-flash-high
       - gemini-3.6-flash-high
+      - gemini-3.1-pro-high
       - gemini-3.6-flash-medium
     profiles:
       fast:
@@ -112,6 +114,12 @@ workers:
         label: Strong
         model: gemini-3.1-pro-high
         effort: high
+    # v2: orchestrator model+effort recommendation per task kind (universal selector)
+    recommend_by_task:
+      read:     { model: gemini-3.6-flash-medium, effort: medium }
+      write:    { model: gemini-3.1-pro-high,    effort: high }
+      design:   { model: claude-sonnet-4-6,      effort: null }
+      heavy:    { model: claude-opus-4-6-thinking, effort: null }
 
   opencode:
     enabled: true
@@ -146,7 +154,8 @@ failover:
     - unavailable
     - invalid_result_contract
     - invalid_model_selection
-  try_model_fallback_once: true
+  # v2: walk the ENTIRE model_fallback chain in order before switching worker
+  walk_model_fallback_chain: true
   to_other_worker: true
   max_attempts_per_phase: 2
 

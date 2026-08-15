@@ -1,12 +1,12 @@
-# Phase-Launch Checklist (Worker Bridge v1)
+# Phase-Launch Checklist (Worker Bridge v2)
 
-Orchestrator decision procedure. Run before every SDD phase.
+Orchestrator decision procedure. Run before EVERY sub-agent launch (SDD phase or delegated task).
 
 ## A. Bootstrap (once per session)
 
 - [ ] Preflight complete including `worker_policy`
 - [ ] Load `~/.config/gentle-ai/workers.yaml` + optional `.atl/sdd-workers.yaml`
-- [ ] `agy.available` via PATH; cache `agy models` once (probe `--output-format json`, fall back to plain tab-separated list)
+- [ ] `agy.available` via PATH; cache agy model catalog into `session.agy_models` (`agy models`, probe `--output-format json`, fall back to plain tab-separated list)
 - [ ] Init exhausted flags false; empty phase_bindings
 
 ## B. Pre-launch
@@ -14,8 +14,9 @@ Orchestrator decision procedure. Run before every SDD phase.
 - [ ] Identify `phase`, `change`, `project`, `artifact_store`, `execution_mode`, `git_root`
 - [ ] If phase ineligible → binding.worker=opencode → launch
 - [ ] Resolve worker per policy (ask / prefer / only)
-- [ ] Resolve model+effort if worker=agy
-- [ ] Freeze `phase_bindings[phase]`
+- [ ] Resolve model+effort if worker=agy — universal selector: list catalog, recommend per task kind, accept or pick
+- [ ] Applies to ALL sub-agents (SDD phases AND delegated tasks); task bindings keyed by fingerprint
+- [ ] Freeze `phase_bindings[phase]` / `task_bindings[fingerprint]`
 - [ ] Build phase_prompt (executor role, skills paths, deps refs, allowlist, result contract)
 
 ## C. Launch
@@ -49,8 +50,8 @@ error_class: null | quota_exceeded | timeout | unavailable | contract | unknown
 ## F. Retry / failover
 
 1. contract → same worker once  
-2. agy quota/unavail → model_fallback once  
-3. other worker once (mark exhausted on quota when leaving worker)  
+2. agy quota_exceeded → walk whole model_fallback chain in order (same worker, next model, no re-ask)  
+3. entire agy chain quota-failed / agy unavailable → other worker once (mark exhausted)  
 4. STOP
 
 ## G. Post-phase success
@@ -61,4 +62,4 @@ error_class: null | quota_exceeded | timeout | unavailable | contract | unknown
 
 ## H. Invariants
 
-One orchestrator · one worker at a time · store wins · ≤1 worker failover · review lifecycle + commit/PR stay on OpenCode
+One orchestrator · one worker at a time · store wins · ≤1 worker question + ≤1 model question per launch; walk model chain on quota · review lifecycle + commit/PR stay on OpenCode
