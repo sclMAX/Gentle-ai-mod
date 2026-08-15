@@ -57,7 +57,9 @@ workers:
     # auto|on|off — native /sdd-<phase> skill expansion in print mode.
     # auto: enabled when agy >= 1.1.9; off: literal prompts (+ --disable-slash-commands).
     slash_command_skills: auto
-    transport: direct
+    # Phase 2: herdr transport enabled by default (smoke-tested 2026-08-15).
+    # Rollback: set transport back to `direct` (no code change needed).
+    transport: herdr
     herdr:
       tab_label: "sdd-{phase}-{change}"
       stalled_gate:
