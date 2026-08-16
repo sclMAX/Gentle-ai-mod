@@ -181,21 +181,28 @@ function installGentleAi() {
   const readme = join(destRoot, "README.md");
   const body = `# gentle-ai (installed by Gentle-ai-mod)
 
-- workers.yaml — SDD worker bridge policy
-- bin/run-agy-phase.mjs — launch one SDD phase via agy (v1.2: json-schema default)
-- bin/run-agy-task.mjs — launch a non-SDD delegated task via agy
+- workers.yaml — SDD worker bridge v2 policy (model/effort, fallback chain, herdr config)
+- bin/run-agy-phase.mjs — v2 phase wrapper (spawns the herdr runner)
+- bin/run-agy-phase-herdr.mjs — herdr transport runner (the real runner; herdr daemon required)
+- bin/run-agy-task.mjs — launch a non-SDD delegated task via agy (explore|general|writer)
 - bin/patch-orchestrator-worker-bridge.mjs — re-apply orchestrator prompt patch
 - schemas/sdd-phase-result.schema.json — default phase result contract for --json-schema
+
+Prerequisite: herdr daemon on PATH and running, HERDR_SOCKET_PATH absolute (see repo root README).
 
 Re-run installer from the repo after upgrades:
   node install.mjs
   node install.mjs --check
 
-Runner flags (v1.2):
+Runner flags (v2):
   --output-format json|stream-json
   --json-schema default|none|<path>
   --no-json-schema
-  --stream-progress
+  --slash-command-skills auto|on|off
+  --stream-progress | --no-stream-progress
+  --stream-progress-detail summary|tools|full
+
+Exit codes: 0 ok | 2 usage | 4 agy/herdr fail | 5 contract | 6 herdr missing | 7 blocked | 8 stalled
 
 Restart OpenCode after install/patch.
 `;
