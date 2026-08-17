@@ -333,6 +333,220 @@ exit 1
   assert.match(out.message, /crashed|terminal dead state/);
 });
 
+test("stalled prompt with idle agent re-sends and completes on the second attempt", () => {
+  // v2.1 regression: `agent_prompt_stalled` + agent still idle with unchanged
+  // seq/revision means the prompt text was never delivered (agy TUI not ready).
+  // The runner must re-send it once the TUI is ready instead of polling forever.
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-ressend-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const stateFile = join(fakeDir, "state.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(stateFile, "0");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-ressend"},"root_pane":{"pane_id":"p-ressend"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"idle","state_change_seq":1,"revision":1}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    COUNT=$(cat "$STATE")
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$STATE"
+    if [ "$COUNT" -eq 1 ]; then
+      echo "agent_prompt_stalled: no state change observed within 5000ms" >&2
+      exit 1
+    fi
+    SENTINEL=$(echo "$4" | grep -oE '/[^ ]+agy_result_[0-9]+\\.json' | tail -1)
+    echo '{"status":"success","executive_summary":"delivered on retry","artifacts":["fix.js"],"next_recommended":"","risks":[],"worker":"agy","phase":"explore","project":"p","change_name":"c","error_class":null}' > "$SENTINEL"
+    exit 0
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    STATE: stateFile,
+    GGA_HERDR_STALL_RETRY_MS: "1",
+    GGA_HERDR_MAX_STALL_RETRY_ATTEMPTS: "3",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 0, `Expected exit 0, got ${result.status}. stdout: ${result.stdout} stderr: ${result.stderr}`);
+  const promptCalls = (capture.match(/CALL:agent prompt/g) || []).length;
+  const tabCreates = (capture.match(/CALL:tab create/g) || []).length;
+  const tabCloses = (capture.match(/CALL:tab close/g) || []).length;
+  assert.strictEqual(promptCalls, 2, `Expected exactly 2 prompt calls (1 stalled + 1 re-send), got ${promptCalls}`);
+  assert.strictEqual(tabCreates, 1);
+  assert.strictEqual(tabCloses, 1);
+
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "success");
+  assert.strictEqual(out.executive_summary, "delivered on retry");
+});
+
+test("stalled prompt with idle agent exhausts re-send attempts and dies prompt_delivery_failed", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-ressend-fail-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-ressend-fail"},"root_pane":{"pane_id":"p-ressend-fail"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"idle","state_change_seq":1,"revision":1}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    echo "agent_prompt_stalled: no state change observed within 5000ms" >&2
+    exit 1
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    GGA_HERDR_STALL_RETRY_MS: "1",
+    GGA_HERDR_MAX_STALL_RETRY_ATTEMPTS: "2",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 4, `Expected exit 4, got ${result.status}. stdout: ${result.stdout} stderr: ${result.stderr}`);
+  const promptCalls = (capture.match(/CALL:agent prompt/g) || []).length;
+  assert.strictEqual(promptCalls, 3, `Expected 3 prompt calls (1 initial + 2 re-sends), got ${promptCalls}`);
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "failed");
+  assert.strictEqual(out.error_class, "stalled");
+  assert.strictEqual(out.stall_reason, "prompt_delivery_failed");
+});
+
+test("done without sentinel waits within grace for the late sentinel file", () => {
+  // v2.1 regression: Claude (Thinking) reports `done` when its first response
+  // turn completes, then writes the sentinel in a later turn. The runner must
+  // keep polling within SENTINEL_GRACE_MS instead of dying at ~1s.
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-grace-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const stateFile = join(fakeDir, "state.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(stateFile, "0");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-grace"},"root_pane":{"pane_id":"p-grace"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then
+    COUNT=$(cat "$STATE")
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$STATE"
+    if [ "$COUNT" -lt 3 ]; then
+      # Agent reports done but the sentinel has NOT been written yet (Claude
+      # writes it in a later turn).
+      echo '{"result":{"agent":{"agent_status":"done","state_change_seq":3,"revision":2}}}'
+      exit 0
+    fi
+    SENTINEL=$(grep -oE '/[^ ]+agy_result_[0-9]+\\.json' "$CAPTURE" | head -1)
+    if [ -n "$SENTINEL" ]; then
+      echo '{"status":"success","executive_summary":"late sentinel within grace","artifacts":["x"],"next_recommended":"","risks":[],"worker":"agy","phase":"explore","project":"p","change_name":"c","error_class":null}' > "$SENTINEL"
+    fi
+    echo '{"result":{"agent":{"agent_status":"done","state_change_seq":3,"revision":2}}}'
+    exit 0
+  fi
+  if [ "$2" = "prompt" ]; then exit 0; fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    STATE: stateFile,
+    GGA_HERDR_SENTINEL_GRACE_MS: "5000",
+    GGA_HERDR_POLL_INTERVAL_MS: "30",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 0, `Expected exit 0, got ${result.status}. stdout: ${result.stdout} stderr: ${result.stderr}`);
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "success");
+  assert.strictEqual(out.executive_summary, "late sentinel within grace");
+});
+
+test("done without sentinel exceeding the grace window dies contract violation", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-grace-fail-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+echo "CALL:$*" >> "$CAPTURE"
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then
+  if [ "$2" = "create" ]; then echo '{"result":{"tab":{"tab_id":"t-grace-fail"},"root_pane":{"pane_id":"p-grace-fail"}}}'; exit 0; fi
+  if [ "$2" = "close" ]; then exit 0; fi
+fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0; fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"done","state_change_seq":3,"revision":2}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then exit 0; fi
+fi
+exit 1
+`, { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+    GGA_HERDR_SENTINEL_GRACE_MS: "100",
+    GGA_HERDR_POLL_INTERVAL_MS: "20",
+  };
+
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd()
+  ], { env, timeout: 30000 });
+
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 5, `Expected exit 5, got ${result.status}. stdout: ${result.stdout} stderr: ${result.stderr}`);
+  const out = JSON.parse(result.stdout.toString());
+  assert.strictEqual(out.status, "failed");
+  assert.strictEqual(out.error_class, "contract");
+});
+
 test("startup timeout when agent stays idle and never starts exits with stalled error and cleans up tab", () => {
   const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-timeout-"));
   const captureFile = join(fakeDir, "capture.txt");

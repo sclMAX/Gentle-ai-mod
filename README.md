@@ -132,14 +132,14 @@ Flow per run:
 
 Runtime safeguards:
 
-- **Stall gates (two-tier):** tier-1 startup timeout (default 60s) before any activity; tier-2 inactivity timeout (`max(prompt timeout, 120s)`) after activity stops → exit 8 `stalled` with `stall_reason: startup_timeout | inactivity_timeout`
+- **Stall gates (two-tier):** tier-1 startup timeout (default 60s) before any activity; tier-2 inactivity timeout (`max(prompt timeout, 120s)`) after activity stops → exit 8 `stalled` with `stall_reason: startup_timeout | inactivity_timeout | prompt_delivery_failed`
 - **Blocked prompts:** status `blocked` emits a `permission_required` envelope, waits 300s for the human → exit 7 `blocked_timeout`
 - **Account verification:** the runner detects `verifying your account / account eligibility` and retries the prompt with backoff (15s, up to 5 attempts) → exit 4 `unavailable` with `stall_reason: account_verification`
-- **Stall reconciliation:** an inconclusive prompt close never re-submits a duplicate prompt; if the agent is still alive it keeps polling until the sentinel appears (or exit 5 `contract` if the agent reports `done` without a result file)
+- **Stall reconciliation (v2.1):** an inconclusive prompt close never re-submits a duplicate prompt. If the agent is still alive it keeps polling until the sentinel appears. `agent_prompt_stalled` with the agent **still idle and seq/revision unchanged** means the prompt text was never delivered (agy TUI not ready) — the runner **re-sends the prompt** with backoff (8s, up to 3 attempts) → exit 4 `stalled` with `stall_reason: prompt_delivery_failed` when exhausted. If the agent reports `done` without a result file, the runner **keeps polling within the sentinel grace window** (60s) instead of dying at ~1s — Claude (Thinking) models finish their first response turn before writing the sentinel in a later turn → exit 5 `contract` only after the grace expires
 - **Worktree behavior:** apply runs in the **main worktree** — herdr worktree isolation was dropped; git itself is the safety net and the RDD correction transaction expects candidate changes in the lineage repo
 - On success, the conversation id is saved to engram (`engram save <title> <conversationId> --type architecture`)
 
-Tunable env vars (`run-agy-phase-herdr.mjs`): `HERDR_SOCKET_PATH` (required, absolute), `HERDR_WORKSPACE_ID` (default `default`), `GGA_HERDR_VERIFY_RETRY_MS` (15000), `GGA_HERDR_MAX_VERIFY_ATTEMPTS` (5), `GGA_HERDR_STARTUP_TIMEOUT_MS` (60000), `GGA_HERDR_INACTIVITY_TIMEOUT_MS` (default `max(prompt timeout, 120000)`), `GGA_HERDR_POLL_INTERVAL_MS` (2000).
+Tunable env vars (`run-agy-phase-herdr.mjs`): `HERDR_SOCKET_PATH` (required, absolute), `HERDR_WORKSPACE_ID` (default `default`), `GGA_HERDR_VERIFY_RETRY_MS` (15000), `GGA_HERDR_MAX_VERIFY_ATTEMPTS` (5), `GGA_HERDR_STARTUP_TIMEOUT_MS` (60000), `GGA_HERDR_INACTIVITY_TIMEOUT_MS` (default `max(prompt timeout, 120000)`), `GGA_HERDR_POLL_INTERVAL_MS` (2000), `GGA_HERDR_SENTINEL_GRACE_MS` (60000), `GGA_HERDR_STALL_RETRY_MS` (8000), `GGA_HERDR_MAX_STALL_RETRY_ATTEMPTS` (3).
 
 > Note: the `herdr.stalled_gate` / `allowlist` keys in `workers.yaml` are reference documentation for the transport; the runner's actual gate values come from the env vars above.
 
@@ -262,11 +262,17 @@ cd Gentle-ai-mod && git pull && node install.mjs
 node --test test/
 ```
 
-Covers socket validation, prompt-file shell-interpolation security, cwd escape prevention, account-verification retry, stalled-prompt reconciliation (no duplicate tab/prompt), model/effort/timeout forwarding, apply in main worktree, crash cleanup, and the task launcher routing.
+Covers socket validation, prompt-file shell-interpolation security, cwd escape prevention, account-verification retry, stalled-prompt reconciliation (no duplicate tab/prompt), stalled-prompt re-send (delivered on retry and exhausted `prompt_delivery_failed`), sentinel grace (late sentinel within the window and contract violation after it expires), model/effort/timeout forwarding, apply in main worktree, crash cleanup, and the task launcher routing.
 
 ---
 
 ## Changelog
+
+### v2.1
+
+- **Sentinel grace (`GGA_HERDR_SENTINEL_GRACE_MS`, default 60s)** — when herdr reports `done` but the sentinel result file is not there yet, the runner keeps polling within the grace window instead of dying at ~1s with `Contract violation: result file not found`. Fixes the deterministic Claude (Thinking) failure: those models finish their first response turn (herdr's `done`) before writing the sentinel in a later turn
+- **Stalled-prompt re-send (`GGA_HERDR_STALL_RETRY_MS` 8s, `GGA_HERDR_MAX_STALL_RETRY_ATTEMPTS` 3)** — `agent_prompt_stalled` with the agent still idle and seq/revision unchanged means the prompt text was never delivered (agy TUI not ready); the runner re-sends the prompt with backoff, then exits 4 `stalled` with `stall_reason: prompt_delivery_failed`
+- **Test coverage:** +4 regression tests (stalled re-send success, exhausted re-send, late sentinel within grace, grace-exceeded contract violation) — 15 total
 
 ### v2.0
 

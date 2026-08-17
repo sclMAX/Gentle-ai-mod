@@ -203,6 +203,16 @@ const VERIFY_PATTERN = /verifying your account|account eligibility|try again sho
 const VERIFY_RETRY_MS = Number(process.env.GGA_HERDR_VERIFY_RETRY_MS || 15000);
 const RETRY_MS = Number(process.env.GGA_HERDR_RETRY_MS || 3000);
 const MAX_VERIFY_ATTEMPTS = Number(process.env.GGA_HERDR_MAX_VERIFY_ATTEMPTS || 5);
+// v2.1: sentinel grace — after herdr reports `done`, keep polling for the
+// sentinel result file for this long. Claude (Thinking) models finish their
+// first response turn before writing the sentinel in a later turn; the old 1s
+// grace produced deterministic "Contract violation: result file not found".
+const SENTINEL_GRACE_MS = Number(process.env.GGA_HERDR_SENTINEL_GRACE_MS || 60000);
+// v2.1: stalled-prompt re-send — on `agent_prompt_stalled` with the agent still
+// idle and seq/revision unchanged, the prompt was never delivered (agy TUI not
+// ready). Re-send it with backoff up to MAX_STALL_RETRY_ATTEMPTS times.
+const STALL_RETRY_MS = Number(process.env.GGA_HERDR_STALL_RETRY_MS || 8000);
+const MAX_STALL_RETRY_ATTEMPTS = Number(process.env.GGA_HERDR_MAX_STALL_RETRY_ATTEMPTS || 3);
 
 let promptOutput = "";
 let verifyMode = false;
@@ -298,6 +308,12 @@ function launchPrompt() {
   if (finished) return;
   promptAttempt++;
   promptOutput = "";
+  // Capture the agent's observed state before submitting. If the prompt
+  // stalls and the agent is still idle with the same seq/revision, the
+  // prompt was never delivered (agy TUI not ready) — re-send it.
+  const preAgent = getAgentInfo();
+  seqAtPrompt = preAgent?.state_change_seq ?? null;
+  revAtPrompt = preAgent?.revision ?? null;
   child = spawn("herdr", promptArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.on("data", (d) => { promptOutput += d; process.stdout.write(d); });
   child.stderr.on("data", (d) => { promptOutput += d; process.stderr.write(d); });
@@ -353,15 +369,30 @@ function launchPrompt() {
         completeWithResult(lastCheck);
         return;
       }
-      setTimeout(() => {
-        if (finished) return;
-        const res = tryReadSentinel();
-        if (res) {
-          completeWithResult(res);
-        } else {
-          die(5, "Contract violation: result file not found", { error_class: "contract" });
-        }
-      }, 1000);
+      // v2.1: do NOT die at 1s here — the poll observes `done` and enforces
+      // SENTINEL_GRACE_MS. Claude (Thinking) writes the sentinel in a later
+      // turn, seconds after herdr first reports done.
+      return;
+    }
+
+    // v2.1: stalled-prompt re-send. `agent_prompt_stalled` means herdr saw no
+    // state change within 5s. If the agent is still idle with the SAME
+    // seq/revision as before the prompt, the prompt text was never delivered
+    // (agy TUI not ready) — re-send it with backoff instead of polling forever.
+    const stalled = /agent_prompt_stalled/i.test(promptOutput);
+    const seqUnchanged = agent.state_change_seq === undefined || agent.state_change_seq === null || agent.state_change_seq === seqAtPrompt;
+    const revUnchanged = agent.revision === undefined || agent.revision === null || agent.revision === revAtPrompt;
+    if (stalled && agent.agent_status === "idle" && seqUnchanged && revUnchanged) {
+      if (stallRetryCount < MAX_STALL_RETRY_ATTEMPTS) {
+        stallRetryCount++;
+        setTimeout(launchPrompt, STALL_RETRY_MS);
+        return;
+      }
+      die(4, "Prompt delivery failed: agent stayed idle after repeated stalled prompts", {
+        error_class: "stalled",
+        stall_reason: "prompt_delivery_failed",
+        attempts: stallRetryCount
+      });
       return;
     }
 
@@ -375,6 +406,10 @@ let lastRevision = null;
 let noActivityTime = 0;
 let tier1Passed = false;
 let blocked = false;
+let seqAtPrompt = null;
+let revAtPrompt = null;
+let stallRetryCount = 0;
+let doneObservedAt = null;
 
 const STARTUP_TIMEOUT_MS = Number(process.env.GGA_HERDR_STARTUP_TIMEOUT_MS || 60000);
 const INACTIVITY_TIMEOUT_MS = Number(process.env.GGA_HERDR_INACTIVITY_TIMEOUT_MS || Math.max(promptTimeoutMs, 120000));
@@ -421,16 +456,18 @@ function checkStatus() {
       completeWithResult(lastCheck);
       return;
     }
-    const graceMs = Math.min(1000, POLL_INTERVAL_MS * 2);
-    setTimeout(() => {
-      if (finished) return;
-      const res = tryReadSentinel();
-      if (res) {
-        completeWithResult(res);
-      } else {
-        die(5, "Contract violation: result file not found", { error_class: "contract" });
-      }
-    }, graceMs);
+    // v2.1: herdr reports `done` when the active turn completes, but Claude
+    // (Thinking) writes the sentinel result file in a LATER turn. Keep polling
+    // within SENTINEL_GRACE_MS instead of dying at ~1s.
+    if (doneObservedAt === null) {
+      doneObservedAt = Date.now();
+    } else if (Date.now() - doneObservedAt >= SENTINEL_GRACE_MS) {
+      die(5, "Contract violation: result file not found", {
+        error_class: "contract",
+        sentinel_grace_ms: SENTINEL_GRACE_MS
+      });
+      return;
+    }
     return;
   }
 
@@ -443,6 +480,7 @@ function checkStatus() {
   if (active) {
     noActivityTime = 0;
     tier1Passed = true;
+    doneObservedAt = null; // agent resumed; a later `done` restarts the grace window
   } else {
     noActivityTime += POLL_INTERVAL_MS;
     if (!tier1Passed && noActivityTime >= STARTUP_TIMEOUT_MS && !verifyMode) {
