@@ -126,7 +126,7 @@ Flow per run:
 
 1. **Preflight:** `HERDR_SOCKET_PATH` must be absolute and `herdr status` must succeed — otherwise exit 6 `herdr_missing`
 2. **Tab:** `herdr tab create --workspace <id> --cwd <repo> --label sdd-<phase>-<change>` (or `agy-task-<kind>`)
-3. **Agent:** `herdr agent start <name> --kind agy --pane <paneId> [-- --model X --effort Y]` — model/effort/timeout are forwarded so agy does not fall back to its own defaults (`--effort` is omitted for Claude/gpt-oss models that reject it)
+3. **Agent:** `herdr agent start <name> --kind agy --pane <paneId> [-- --model X --effort Y --extra-flag ...]` — model/effort/timeout are forwarded so agy does not fall back to its own defaults (`--effort` is omitted for Claude/gpt-oss models that reject it). **Extra args** from `workers.agy.extra_args` (e.g. `--dangerously-skip-permissions`) are injected after model/effort; managed flags (`--output-format`, `--json-schema`, `--no-json-schema` + their values) are stripped to avoid conflicts
 4. **Prompt:** `herdr agent prompt <target> <prompt> --wait --timeout <ms>` — the prompt instructs agy to write its structured result JSON to an absolute sentinel file under the OS tmpdir
 5. **Capture:** a poll loop watches the sentinel file and the agent status; the sentinel JSON becomes the result envelope. Each run uses **exactly one tab and one prompt**; the tab is closed on every exit path
 
@@ -193,7 +193,7 @@ node ~/.config/gentle-ai/bin/run-agy-task.mjs \
 
 ### herdr runner (direct)
 
-`run-agy-phase-herdr.mjs` accepts the same core flags plus `--task-kind`/`--task-label`, and requires either `--phase` + `--change` (SDD) or `--task-kind` (task), always with `--project` and a `--cwd` inside the git repo root. `--dry-run` prints the resolved transport, prompt length, model/effort/timeout and agent start args without requiring herdr.
+`run-agy-phase-herdr.mjs` accepts the same core flags plus `--task-kind`/`--task-label`, and requires either `--phase` + `--change` (SDD) or `--task-kind` (task), always with `--project` and a `--cwd` inside the git repo root. `--extra-args <json>` accepts a JSON array of additional agy CLI flags (injected by the wrapper from `workers.agy.extra_args`). `--dry-run` prints the resolved transport, prompt length, model/effort/timeout and agent start args without requiring herdr.
 
 ### Exit codes
 
@@ -262,11 +262,16 @@ cd Gentle-ai-mod && git pull && node install.mjs
 node --test test/
 ```
 
-Covers socket validation, prompt-file shell-interpolation security, cwd escape prevention, account-verification retry, stalled-prompt reconciliation (no duplicate tab/prompt), stalled-prompt re-send (delivered on retry and exhausted `prompt_delivery_failed`), sentinel grace (late sentinel within the window and contract violation after it expires), model/effort/timeout forwarding, apply in main worktree, crash cleanup, and the task launcher routing.
+Covers socket validation, prompt-file shell-interpolation security, cwd escape prevention, account-verification retry, stalled-prompt reconciliation (no duplicate tab/prompt), stalled-prompt re-send (delivered on retry and exhausted `prompt_delivery_failed`), sentinel grace (late sentinel within the window and contract violation after it expires), model/effort/timeout forwarding, extra-args forwarding and malformed JSON handling, apply in main worktree, crash cleanup, and the task launcher routing.
 
 ---
 
 ## Changelog
+
+### v2.2
+
+- **`extra_args` passthrough** — `workers.agy.extra_args` from `workers.yaml` is now injected into agy CLI args via the herdr transport. The wrapper computes the filtered list (strips managed flags `--output-format`, `--json-schema`, `--no-json-schema` and their values), passes it as `--extra-args <json>` to the herdr runner, which appends parsed entries after model/effort. Fixes `declaring permissions: cortex tool write_to_file: invalid tool call error (invalid_args)` when agy's permission engine fails on sentinel file writes outside trusted workspaces. Malformed JSON is silently ignored
+- **Test coverage:** +2 tests (extra-args forwarding, malformed JSON handling) — 17 total
 
 ### v2.1
 

@@ -390,7 +390,29 @@ if (requestedTransport !== "herdr") {
 }
 
 const herdrRunner = join(__dirname, "run-agy-phase-herdr.mjs");
-const res = spawnSync(process.execPath, [herdrRunner, ...process.argv.slice(2)], {
+
+// v2.2: Compute filtered extra_args from workers.yaml config.
+// The runner manages --output-format, --json-schema, and --no-json-schema
+// directly — strip them (and their values) from extra_args to avoid conflicts.
+const MANAGED_FLAGS = new Set(["--output-format", "--json-schema", "--no-json-schema"]);
+const rawExtraArgs = cfg.workers?.agy?.extra_args;
+const filteredExtraArgs = [];
+if (Array.isArray(rawExtraArgs)) {
+  let skipNext = false;
+  for (const a of rawExtraArgs) {
+    if (skipNext) { skipNext = false; continue; }
+    if (MANAGED_FLAGS.has(a)) { skipNext = true; continue; }
+    filteredExtraArgs.push(a);
+  }
+}
+
+// Build herdr args: forward all original CLI args, then inject extra_args.
+const herdrArgs = [...process.argv.slice(2)];
+if (filteredExtraArgs.length > 0) {
+  herdrArgs.push("--extra-args", JSON.stringify(filteredExtraArgs));
+}
+
+const res = spawnSync(process.execPath, [herdrRunner, ...herdrArgs], {
   stdio: "inherit",
   env: process.env,
 });

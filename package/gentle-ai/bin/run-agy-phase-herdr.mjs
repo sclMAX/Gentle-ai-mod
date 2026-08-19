@@ -59,6 +59,7 @@ if (!dryRun) {
 
 let phase, taskKind, taskLabel, change, project, cwd = process.cwd(), promptText = "", promptFile = "";
 let model = null, effort = null, timeoutArg = null;
+let extraArgsRaw = null; // JSON array string from wrapper (--extra-args)
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -74,6 +75,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--model") model = next();
   else if (a === "--effort") effort = next();
   else if (a === "--timeout") timeoutArg = next();
+  else if (a === "--extra-args") extraArgsRaw = next();
 }
 
 /**
@@ -143,6 +145,12 @@ function agentStartArgsForDryRun() {
   const cli = [];
   if (model) cli.push("--model", String(model));
   if (effort && modelSupportsEffortFlag(model)) cli.push("--effort", String(effort));
+  if (extraArgsRaw) {
+    try {
+      const parsed = JSON.parse(extraArgsRaw);
+      if (Array.isArray(parsed)) cli.push(...parsed);
+    } catch (_) {}
+  }
   if (cli.length) args.push("--", ...cli);
   return args;
 }
@@ -177,6 +185,19 @@ const agentStartArgs = ["agent", "start", agentName, "--kind", "agy", "--pane", 
 const agentCliArgs = [];
 if (model) agentCliArgs.push("--model", String(model));
 if (effort && modelSupportsEffortFlag(model)) agentCliArgs.push("--effort", String(effort));
+// v2.2: inject extra_args from workers.yaml (passed by the wrapper via --extra-args).
+// These are config-driven agy CLI flags that the runner does not manage directly
+// (e.g. --dangerously-skip-permissions). The wrapper strips flags the runner
+// already controls (--output-format, --json-schema) before forwarding.
+if (extraArgsRaw) {
+  try {
+    const parsed = JSON.parse(extraArgsRaw);
+    if (Array.isArray(parsed)) agentCliArgs.push(...parsed);
+  } catch (_) {
+    // Malformed extra_args: ignore silently rather than blocking the run.
+    // The wrapper is responsible for producing valid JSON.
+  }
+}
 if (agentCliArgs.length) agentStartArgs.push("--", ...agentCliArgs);
 const agentRes = spawnSync("herdr", agentStartArgs, { encoding: "utf8" });
 if (agentRes.status !== 0) {

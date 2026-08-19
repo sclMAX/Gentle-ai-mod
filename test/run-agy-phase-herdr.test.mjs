@@ -169,6 +169,89 @@ exit 1
   assert.match(out, /"prompt_timeout_ms": 1200000/);
 });
 
+test("--extra-args JSON array is forwarded to agy agent start after model/effort", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-extraargs-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then echo '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1"}}}'; exit 0; fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then
+    echo "START:$*" >> "$CAPTURE"
+    echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0
+  fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"done","state_change_seq":1,"revision":1}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    SENTINEL=$(echo "$4" | grep -oE '/[^ ]+agy_result_[0-9]+\\.json' | tail -1)
+    echo '{"status":"success","executive_summary":"ok","artifacts":["x"],"next_recommended":"","risks":[],"skill_resolution":"paths-injected","worker":"agy","phase":"explore","project":"p","change_name":"c","error_class":null}' > "$SENTINEL"
+    exit 0
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+  };
+  const extraArgs = JSON.stringify(["--dangerously-skip-permissions"]);
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd(),
+    "--model", "gemini-3.7-flash-high", "--effort", "high",
+    "--extra-args", extraArgs
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  assert.strictEqual(result.status, 0);
+  // extra_args must appear AFTER model/effort in the agent start args
+  assert.match(capture, /START:.*--model gemini-3\.7-flash-high --effort high --dangerously-skip-permissions/);
+});
+
+test("--extra-args with malformed JSON is silently ignored", () => {
+  const fakeDir = mkdtempSync(join(tmpdir(), "fake-herdr-bad-extraargs-"));
+  const captureFile = join(fakeDir, "capture.txt");
+  const fakeHerdr = join(fakeDir, "herdr");
+  writeFileSync(fakeHerdr, `#!/bin/bash
+if [ "$1" = "status" ]; then exit 0; fi
+if [ "$1" = "tab" ]; then echo '{"result":{"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"p1"}}}'; exit 0; fi
+if [ "$1" = "agent" ]; then
+  if [ "$2" = "start" ]; then
+    echo "START:$*" >> "$CAPTURE"
+    echo '{"result":{"agent":{"name":"fake-agent"}}}'; exit 0
+  fi
+  if [ "$2" = "get" ]; then echo '{"result":{"agent":{"agent_status":"done","state_change_seq":1,"revision":1}}}'; exit 0; fi
+  if [ "$2" = "prompt" ]; then
+    SENTINEL=$(echo "$4" | grep -oE '/[^ ]+agy_result_[0-9]+\\.json' | tail -1)
+    echo '{"status":"success","executive_summary":"ok","artifacts":["x"],"next_recommended":"","risks":[],"skill_resolution":"paths-injected","worker":"agy","phase":"explore","project":"p","change_name":"c","error_class":null}' > "$SENTINEL"
+    exit 0
+  fi
+fi
+exit 1
+`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    HERDR_SOCKET_PATH: "/tmp/fake.sock",
+    PATH: fakeDir + ":" + process.env.PATH,
+    CAPTURE: captureFile,
+  };
+  const result = spawnSync(process.execPath, [
+    runnerPath, "--phase", "explore", "--change", "c", "--project", "p", "--cwd", process.cwd(),
+    "--extra-args", "not-valid-json{"
+  ], { env, timeout: 30000 });
+
+  const capture = readFileSync(captureFile, "utf8");
+  rmSync(fakeDir, { recursive: true, force: true });
+
+  // Should complete successfully despite malformed extra_args
+  assert.strictEqual(result.status, 0);
+  // The start args should NOT contain the malformed string
+  assert.doesNotMatch(capture, /not-valid-json/);
+});
+
 test("apply runs in the main worktree - never creates/removes a herdr worktree", () => {
   // Fake `herdr` that records every invocation and completes a prompt by
   // writing the sentinel file it extracts from the prompt text.
