@@ -112,6 +112,7 @@ Gentle-ai-mod/
 - **Data-driven model gate (HARD GATE):** model/effort recommendations never live in prompt or skill memory — the effective `workers.yaml` (+ `.atl/sdd-workers.yaml`) is the only source of truth and must be read each session
 - **Failover:** 1× corrective retry on same worker → agy `quota_exceeded` walks the **whole** `model_fallback` chain in order → entire agy chain failed → other worker once (agy marked exhausted) → STOP. Max 2 worker attempts per phase
 - **Authority:** the store (Engram/OpenSpec artifact) wins over CLI stdout — PASS requires a readable canonical artifact plus a coherent `next_recommended`
+- **Prompt language:** every agy `--prompt-file` and delegated sub-agent prompt is written in **English** as the carrier of the Language Domain Contract (artifacts stay English); user-facing text (questions, preflight, summaries) stays in the active persona language
 - **Summary line:** `phase · worker · model · effort · duration · status · failover?`
 
 Config defaults live in `package/gentle-ai/workers.yaml`.
@@ -267,6 +268,10 @@ Covers socket validation, prompt-file shell-interpolation security, cwd escape p
 ---
 
 ## Changelog
+
+### v2.3
+
+- **English delegation prompts** — the worker bridge now enforces that every agy `--prompt-file` and every delegated sub-agent prompt is written in **English**, as the carrier of the Language Domain Contract, so executor artifacts (specs, design, tasks, code, tests, UI copy) stay English. User-facing orchestrator text (questions, preflight, phase summaries) stays in the active persona language. Re-run `patch-orchestrator-worker-bridge.mjs` to apply the updated bridge section to an installed orchestrator
 
 ### v2.2
 
