@@ -155,6 +155,16 @@ Write the full phase prompt to a temp file under the OS temp dir (or repo-safe t
 
 Always set explicit Engram `project` (runner sets `ENGRAM_PROJECT`).
 
+### Prompt language (explicit)
+
+The `--prompt-file` content for agy — and every delegated sub-agent prompt — is
+written in **English**. The delegation prompt is the carrier of the Language
+Domain Contract: it instructs the executor to produce English artifacts (specs,
+design, tasks, code, tests, fixtures, UI copy) and never inherit the
+persona/conversation voice. Direct user-facing orchestrator text (questions,
+preflight groups, phase summaries) stays in the active persona language;
+delegation prompts do not.
+
 ### Gatekeeper
 
 Stdout envelope is a hint. **Store is authority.**

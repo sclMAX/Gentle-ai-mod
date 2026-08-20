@@ -57,6 +57,7 @@ session.agy_models (cached from \`agy models\` when available)
   \`node ~/.config/gentle-ai/bin/run-agy-phase.mjs --phase <p> --change <c> --project <proj> --cwd <git_root> --artifact-store <mode> --prompt-file <file> [--model] [--effort]\`
 - For non-SDD delegated tasks, use the generic runner (never invent an SDD phase):
   \`node ~/.config/gentle-ai/bin/run-agy-task.mjs --task-kind <explore|general|writer> --project <proj> --cwd <git_root> --prompt-file <file> [--model] [--effort] [--timeout]\`
+- **Prompt language:** write every agy \`--prompt-file\` (and every delegated sub-agent prompt) in **English** — the prompt carries the Language Domain Contract to the executor so artifacts (specs, design, tasks, code, tests, UI copy) stay English. User-facing text (questions, preflight, summaries) stays in the active persona language; delegation prompts do not.
 
 **Gatekeeper:** Engram/OpenSpec artifact is authority; stdout envelope is a hint only.
 
